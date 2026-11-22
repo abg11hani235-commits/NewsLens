@@ -33,9 +33,34 @@ from config import (
     TEXTRANK_DAMPING,
     SUMMARIES_DIR,
 )
-from src.preprocessing import clean_text
+from src.preprocessing import clean_text, ensure_nltk_resources
 
 logger = logging.getLogger("extractive")
+
+# Initialize NLTK tokenizer resources on import
+ensure_nltk_resources()
+
+
+def split_into_sentences(text: str) -> List[str]:
+    """Split text into sentences using NLTK sent_tokenize with regex fallback.
+
+    Args:
+        text (str): Cleaned input text.
+
+    Returns:
+        List[str]: List of sentence strings.
+    """
+    import re
+    try:
+        sentences = nltk.sent_tokenize(text)
+        if sentences:
+            return sentences
+    except Exception as e:
+        logger.warning(f"NLTK sent_tokenize failed ({e}); using regex sentence splitting.")
+
+    # Robust regex fallback splitting by sentence ending punctuation followed by space/newline
+    raw_sents = re.split(r"(?<=[.!?])\s+", text)
+    return [s.strip() for s in raw_sents if s.strip()]
 
 
 def lead_n_summarize(text: str, num_sentences: int = 3) -> str:
@@ -55,7 +80,7 @@ def lead_n_summarize(text: str, num_sentences: int = 3) -> str:
     if not cleaned:
         return ""
 
-    sentences = nltk.sent_tokenize(cleaned)
+    sentences = split_into_sentences(cleaned)
     if len(sentences) <= num_sentences:
         return " ".join(sentences)
 
@@ -121,7 +146,7 @@ def textrank_summarize(
     if not cleaned:
         return ""
 
-    sentences = nltk.sent_tokenize(cleaned)
+    sentences = split_into_sentences(cleaned)
     n = len(sentences)
 
     # Edge cases

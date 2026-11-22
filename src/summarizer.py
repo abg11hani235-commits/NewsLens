@@ -13,6 +13,7 @@ Hardware & Memory Optimization:
 
 import sys
 import time
+import gc
 import logging
 from typing import List, Dict, Any, Optional, Union
 from pathlib import Path
@@ -156,7 +157,13 @@ class AbstractiveSummarizer:
 
         input_token_count = inputs["input_ids"].shape[1]
 
+        # Synchronize CUDA device before timing to ensure accurate latency measurement
+        if self.is_cuda:
+            torch.cuda.synchronize(self.device)
+
         start_time = time.perf_counter()
+        used_cpu_fallback = False
+
         try:
             with torch.inference_mode():
                 summary_ids = self.model.generate(
@@ -165,16 +172,40 @@ class AbstractiveSummarizer:
                     **gen_params,
                 )
         except torch.cuda.OutOfMemoryError:
-            logger.warning("CUDA OOM detected! Clearing cache and attempting CPU fallback...")
+            used_cpu_fallback = True
+            logger.warning(
+                "CUDA Out-Of-Memory (OOM) encountered on GPU! Initiating safe CPU fallback..."
+            )
             torch.cuda.empty_cache()
-            # Temporarily move to CPU for fallback
-            cpu_model = self.model.to("cpu")
-            with torch.inference_mode():
-                summary_ids = cpu_model.generate(
-                    inputs["input_ids"].to("cpu"),
-                    **gen_params,
-                )
-            self.model.to(self.device)
+
+            # Safely transfer all input tensors (including attention_mask) to CPU
+            cpu_inputs = {k: v.to("cpu") for k, v in inputs.items()}
+            original_device = self.device
+
+            try:
+                # Move model to CPU for execution
+                self.model.to("cpu")
+                with torch.inference_mode():
+                    summary_ids = self.model.generate(
+                        cpu_inputs["input_ids"],
+                        attention_mask=cpu_inputs.get("attention_mask"),
+                        **gen_params,
+                    )
+            finally:
+                # Attempt to restore model to original GPU device if memory permits
+                try:
+                    torch.cuda.empty_cache()
+                    self.model.to(original_device)
+                except Exception as restore_err:
+                    logger.warning(
+                        f"Could not restore model back to {original_device} ({restore_err}). Remaining on CPU."
+                    )
+                    self.device = torch.device("cpu")
+                    self.is_cuda = False
+
+        # Synchronize CUDA device after generation to guarantee completed kernel execution
+        if self.is_cuda and not used_cpu_fallback:
+            torch.cuda.synchronize(self.device)
 
         elapsed = time.perf_counter() - start_time
         output_token_count = summary_ids.shape[1]
@@ -186,13 +217,35 @@ class AbstractiveSummarizer:
             del inputs, summary_ids
             torch.cuda.empty_cache()
 
+        device_str = "cpu (oom-fallback)" if used_cpu_fallback else str(self.device)
+
         return {
             "summary": summary_text,
             "latency_sec": round(elapsed, 3),
             "input_tokens": input_token_count,
             "output_tokens": output_token_count,
-            "device": str(self.device),
+            "device": device_str,
         }
+
+    def unload_model(self) -> None:
+        """Explicitly deallocate model and tokenizer from memory and clear GPU cache.
+
+        Crucial for low-memory environments (such as 6GB VRAM or free cloud tiers)
+        to prevent memory exhaustion when switching between models.
+        """
+        logger.info(f"Unloading model '{self.model_name}' from memory...")
+        if hasattr(self, "model") and self.model is not None:
+            del self.model
+            self.model = None
+
+        if hasattr(self, "tokenizer") and self.tokenizer is not None:
+            del self.tokenizer
+            self.tokenizer = None
+
+        gc.collect()
+        if self.is_cuda:
+            torch.cuda.empty_cache()
+        logger.info("Model unloaded and cache cleared successfully.")
 
     def summarize_batch(
         self,

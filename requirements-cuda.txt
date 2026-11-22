@@ -1,0 +1,46 @@
+# ==============================================================================
+# NewsLens - Local GPU Dependencies (CUDA 12.4 / Windows 11)
+# Python 3.12.10 (64-bit) | NVIDIA CUDA 12.4 | PyTorch cu124
+# ==============================================================================
+# Install with:
+# pip install -r requirements-cuda.txt
+# ==============================================================================
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+
+# NLP & Hugging Face Ecosystem
+transformers==4.49.0
+datasets==3.3.2
+accelerate==1.4.0
+tokenizers==0.21.0
+safetensors==0.5.2
+huggingface-hub==0.29.1
+
+# Extractive Summarization & Graph Algorithms
+nltk==3.9.1
+networkx==3.4.2
+
+# Evaluation & Metrics
+evaluate==0.4.3
+rouge-score==0.1.2
+scikit-learn==1.6.1
+
+# Web Application
+gradio==6.32.0
+
+# Data Processing & Numerical Computing
+pandas==2.2.3
+numpy==2.2.3
+scipy==1.15.2
+
+# Visualization
+matplotlib==3.10.1
+seaborn==0.13.2
+
+# Development & Testing
+pytest==8.3.4
+tqdm==4.67.1
+ipykernel==6.29.5
+ipython==8.32.0

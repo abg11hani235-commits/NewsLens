@@ -34,14 +34,41 @@ from config import (
     T5_MAX_INPUT_LENGTH,
 )
 
-# Ensure NLTK punkt is available
-try:
-    nltk.data.find("tokenizers/punkt")
-except LookupError:
-    nltk.download("punkt", quiet=True)
-    nltk.download("punkt_tab", quiet=True)
-
 logger = logging.getLogger("preprocessing")
+
+
+def ensure_nltk_resources() -> bool:
+    """Independently verify and ensure NLTK sentence tokenization resources are available.
+
+    Checks 'punkt' and 'punkt_tab' separately without unnecessary network requests.
+    Falls back gracefully if offline or in a restricted deployment environment.
+
+    Returns:
+        bool: True if NLTK resources are available, False if fallback should be used.
+    """
+    resources = ["tokenizers/punkt", "tokenizers/punkt_tab"]
+    all_available = True
+
+    for res in resources:
+        try:
+            nltk.data.find(res)
+        except LookupError:
+            pkg_name = res.split("/")[-1]
+            logger.info(f"NLTK resource '{res}' not found locally. Attempting download...")
+            try:
+                downloaded = nltk.download(pkg_name, quiet=True)
+                if not downloaded:
+                    logger.warning(f"Could not automatically download NLTK resource '{pkg_name}'.")
+                    all_available = False
+            except Exception as e:
+                logger.warning(f"Network error during NLTK download of '{pkg_name}': {e}")
+                all_available = False
+
+    return all_available
+
+
+# Ensure NLTK resources at module import
+_NLTK_READY = ensure_nltk_resources()
 
 
 def clean_text(text: Optional[str]) -> str:

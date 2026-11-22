@@ -48,6 +48,16 @@ logger = logging.getLogger("main")
 
 def handle_summarize(args: argparse.Namespace) -> None:
     """Handle abstractive summarization CLI request."""
+    if args.sample_size <= 0:
+        logger.error(f"Invalid sample_size ({args.sample_size}). Must be > 0.")
+        sys.exit(1)
+    if args.max_length < args.min_length:
+        logger.error(f"max_length ({args.max_length}) cannot be smaller than min_length ({args.min_length}).")
+        sys.exit(1)
+    if args.num_beams < 1:
+        logger.error(f"num_beams ({args.num_beams}) must be >= 1.")
+        sys.exit(1)
+
     print("=" * 70)
     print(f"Abstractive Summarization: Model '{args.model.upper()}'")
     print("=" * 70)
@@ -89,6 +99,13 @@ def handle_summarize(args: argparse.Namespace) -> None:
 
 def handle_extractive(args: argparse.Namespace) -> None:
     """Handle extractive summarization CLI request."""
+    if args.num_sentences <= 0:
+        logger.error(f"Invalid num_sentences ({args.num_sentences}). Must be > 0.")
+        sys.exit(1)
+    if args.sample_size <= 0:
+        logger.error(f"Invalid sample_size ({args.sample_size}). Must be > 0.")
+        sys.exit(1)
+
     print("=" * 70)
     print(f"Extractive Summarization: Method '{args.method.upper()}'")
     print("=" * 70)
@@ -131,6 +148,10 @@ def handle_extractive(args: argparse.Namespace) -> None:
 
 def handle_evaluate(args: argparse.Namespace) -> None:
     """Handle benchmark evaluation CLI request."""
+    if args.sample_size <= 0:
+        logger.error(f"Invalid sample_size ({args.sample_size}). Must be > 0.")
+        sys.exit(1)
+
     print("=" * 70)
     print(f"Full Comparative Benchmark Evaluation (Sample Size: {args.sample_size})")
     print("=" * 70)
@@ -180,7 +201,20 @@ def main() -> None:
     subparsers.add_parser("eda", help="Run exploratory data analysis and generate distribution charts")
 
     # Mode: Preprocess
-    subparsers.add_parser("preprocess", help="Preprocess raw dataset splits and save to data/processed/")
+    parser_prep = subparsers.add_parser("preprocess", help="Preprocess raw dataset splits and save to data/processed/")
+    parser_prep.add_argument("--force", action="store_true", default=False, help="Force re-cleaning and overwrite existing processed CSV files")
+
+    # Mode: Web / App (Launch Gradio)
+    parser_app = subparsers.add_parser("app", help="Launch NewsLens Gradio web interface")
+    parser_app.add_argument("--server_port", type=int, default=7860, help="Port to serve Gradio on")
+    parser_app.add_argument("--server_name", type=str, default="127.0.0.1", help="Host address to serve Gradio on")
+    parser_app.add_argument("--share", action="store_true", default=False, help="Create a public Gradio share link")
+
+    # Alias: web
+    parser_web = subparsers.add_parser("web", help="Launch NewsLens Gradio web interface (alias for app)")
+    parser_web.add_argument("--server_port", type=int, default=7860, help="Port to serve Gradio on")
+    parser_web.add_argument("--server_name", type=str, default="127.0.0.1", help="Host address to serve Gradio on")
+    parser_web.add_argument("--share", action="store_true", default=False, help="Create a public Gradio share link")
 
     args = parser.parse_args()
 
@@ -193,7 +227,10 @@ def main() -> None:
     elif args.mode == "eda":
         perform_full_eda()
     elif args.mode == "preprocess":
-        preprocess_and_save_all_splits(force=True)
+        preprocess_and_save_all_splits(force=args.force)
+    elif args.mode in ["app", "web"]:
+        from app import launch_app
+        launch_app(server_name=args.server_name, server_port=args.server_port, share=args.share)
 
 
 if __name__ == "__main__":
