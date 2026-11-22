@@ -1,0 +1,57 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Testing & Linting
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# Data directories (exclude large downloaded or generated datasets)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+*.parquet
+*.arrow
+*.tar.gz
+*.zip
+*.csv.gz
+
+# Model Weights, Checkpoints, & Caches
+checkpoints/
+models/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+.cache/
+hf_cache/
+
+# Environment Variables & Secrets
+.env
+.env.*
+!.env.example
+
+# OS & Editor Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

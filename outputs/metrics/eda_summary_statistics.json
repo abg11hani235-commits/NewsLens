@@ -1,0 +1,131 @@
+{
+  "train": {
+    "record_count": 1000,
+    "missing_values": {
+      "article": 0,
+      "highlights": 0
+    },
+    "duplicates": {
+      "id": 0,
+      "article": 41
+    },
+    "article_words": {
+      "min": 50,
+      "max": 1743,
+      "mean": 591.62,
+      "median": 547.0,
+      "std": 286.66,
+      "p25": 363.0,
+      "p75": 780.5,
+      "p95": 1102.4
+    },
+    "summary_words": {
+      "min": 23,
+      "max": 66,
+      "mean": 42.77,
+      "median": 43.0,
+      "std": 7.55,
+      "p25": 37.0,
+      "p75": 49.0,
+      "p95": 54.0
+    },
+    "compression_ratio": {
+      "min": 1.92,
+      "max": 61.12,
+      "mean": 14.15,
+      "median": 12.89,
+      "std": 7.42
+    },
+    "article_summary_word_corr": 0.1268,
+    "vocab_size": {
+      "article_unique_tokens": 53849,
+      "summary_unique_tokens": 10159
+    }
+  },
+  "validation": {
+    "record_count": 200,
+    "missing_values": {
+      "article": 0,
+      "highlights": 0
+    },
+    "duplicates": {
+      "id": 0,
+      "article": 0
+    },
+    "article_words": {
+      "min": 81,
+      "max": 1523,
+      "mean": 562.05,
+      "median": 511.5,
+      "std": 331.81,
+      "p25": 286.5,
+      "p75": 784.0,
+      "p95": 1150.95
+    },
+    "summary_words": {
+      "min": 13,
+      "max": 59,
+      "mean": 33.31,
+      "median": 31.0,
+      "std": 9.92,
+      "p25": 25.0,
+      "p75": 39.25,
+      "p95": 51.05
+    },
+    "compression_ratio": {
+      "min": 2.51,
+      "max": 60.92,
+      "mean": 17.68,
+      "median": 15.34,
+      "std": 11.19
+    },
+    "article_summary_word_corr": 0.185,
+    "vocab_size": {
+      "article_unique_tokens": 20240,
+      "summary_unique_tokens": 2786
+    }
+  },
+  "test": {
+    "record_count": 200,
+    "missing_values": {
+      "article": 0,
+      "highlights": 0
+    },
+    "duplicates": {
+      "id": 0,
+      "article": 0
+    },
+    "article_words": {
+      "min": 102,
+      "max": 1497,
+      "mean": 555.06,
+      "median": 462.5,
+      "std": 329.14,
+      "p25": 282.75,
+      "p75": 776.25,
+      "p95": 1136.55
+    },
+    "summary_words": {
+      "min": 14,
+      "max": 67,
+      "mean": 34.73,
+      "median": 33.5,
+      "std": 9.97,
+      "p25": 26.0,
+      "p75": 43.0,
+      "p95": 52.0
+    },
+    "compression_ratio": {
+      "min": 3.36,
+      "max": 54.08,
+      "mean": 16.55,
+      "median": 14.54,
+      "std": 9.94
+    },
+    "article_summary_word_corr": 0.3108,
+    "vocab_size": {
+      "article_unique_tokens": 20240,
+      "summary_unique_tokens": 2808
+    }
+  }
+}

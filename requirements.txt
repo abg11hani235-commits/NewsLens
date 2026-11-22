@@ -1,0 +1,43 @@
+# ==============================================================================
+# Text Summarization Using Pre-trained Models - Dependencies
+# Python 3.12.10 (64-bit) | Windows 11 | NVIDIA CUDA 12.4
+# ==============================================================================
+# To install PyTorch with CUDA 12.4 wheels:
+# pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+# ==============================================================================
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+
+# NLP & Hugging Face Ecosystem
+transformers==5.23.0
+datasets==5.2.0
+accelerate==1.16.0
+tokenizers==0.23.3
+safetensors==0.8.0
+huggingface-hub==2.4.0
+
+# Extractive Summarization & Graph Algorithms
+nltk==3.10.4
+networkx==3.7
+
+# Evaluation & Metrics
+evaluate==0.4.6
+rouge-score==0.1.2
+scikit-learn==1.9.1
+
+# Data Processing & Numerical Computing
+pandas==3.1.1
+numpy==2.5.4
+scipy==1.18.1
+
+# Visualization
+matplotlib==3.11.2
+seaborn==0.13.2
+
+# Development, Testing, & Notebook Utilities
+pytest==9.2.0
+tqdm==4.70.1
+ipykernel==7.4.0
+ipython==9.18.1

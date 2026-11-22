@@ -1,0 +1,4 @@
+split,records,missing_article,missing_summary,art_words_mean,art_words_median,art_words_min,art_words_max,sum_words_mean,sum_words_median,sum_words_min,sum_words_max,compression_ratio_mean,compression_ratio_median,pearson_r
+train,1000,0,0,591.62,547.0,50,1743,42.77,43.0,23,66,14.15,12.89,0.1268
+validation,200,0,0,562.05,511.5,81,1523,33.31,31.0,13,59,17.68,15.34,0.185
+test,200,0,0,555.06,462.5,102,1497,34.73,33.5,14,67,16.55,14.54,0.3108

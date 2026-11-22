@@ -1,0 +1,90 @@
+{
+  "Lead-3": {
+    "paradigm": "Extractive Heuristic",
+    "rouge": {
+      "rouge1": {
+        "precision": 23.24,
+        "recall": 45.95,
+        "f1": 29.91
+      },
+      "rouge2": {
+        "precision": 9.47,
+        "recall": 20.68,
+        "f1": 12.63
+      },
+      "rougeL": {
+        "precision": 16.83,
+        "recall": 34.06,
+        "f1": 21.82
+      }
+    },
+    "avg_word_count": 62.1,
+    "avg_latency_sec": 0.002
+  },
+  "TextRank": {
+    "paradigm": "Extractive Graph",
+    "rouge": {
+      "rouge1": {
+        "precision": 20.77,
+        "recall": 42.25,
+        "f1": 27.16
+      },
+      "rouge2": {
+        "precision": 6.21,
+        "recall": 13.76,
+        "f1": 8.36
+      },
+      "rougeL": {
+        "precision": 13.99,
+        "recall": 29.01,
+        "f1": 18.4
+      }
+    },
+    "avg_word_count": 66.6,
+    "avg_latency_sec": 0.005
+  },
+  "T5-Small": {
+    "paradigm": "Abstractive Transformer (60M)",
+    "rouge": {
+      "rouge1": {
+        "precision": 28.19,
+        "recall": 37.82,
+        "f1": 31.4
+      },
+      "rouge2": {
+        "precision": 11.12,
+        "recall": 14.68,
+        "f1": 12.23
+      },
+      "rougeL": {
+        "precision": 20.47,
+        "recall": 27.24,
+        "f1": 22.71
+      }
+    },
+    "avg_word_count": 42.9,
+    "avg_latency_sec": 0.984
+  },
+  "BART-Large-CNN": {
+    "paradigm": "Abstractive Transformer (406M)",
+    "rouge": {
+      "rouge1": {
+        "precision": 32.85,
+        "recall": 42.97,
+        "f1": 36.38
+      },
+      "rouge2": {
+        "precision": 14.72,
+        "recall": 19.74,
+        "f1": 16.45
+      },
+      "rougeL": {
+        "precision": 24.43,
+        "recall": 32.12,
+        "f1": 27.11
+      }
+    },
+    "avg_word_count": 41.9,
+    "avg_latency_sec": 0.973
+  }
+}
