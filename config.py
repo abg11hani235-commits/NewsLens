@@ -78,7 +78,7 @@ TEXTRANK_NUM_SENTENCES = 3
 TEXTRANK_DAMPING = 0.85
 
 # Generation Hyperparameters for Abstractive Models
-GENERATION_PARAMS = {
+GENERATION_PARAMS_QUALITY = {
     "max_length": 128,
     "min_length": 30,
     "num_beams": 4,
@@ -86,6 +86,21 @@ GENERATION_PARAMS = {
     "early_stopping": True,
     "no_repeat_ngram_size": 3,
 }
+
+GENERATION_PARAMS_FAST = {
+    "max_length": 128,
+    "min_length": 30,
+    "num_beams": 1,
+    "no_repeat_ngram_size": 3,
+}
+
+GENERATION_PRESETS = {
+    "quality": GENERATION_PARAMS_QUALITY,
+    "fast": GENERATION_PARAMS_FAST,
+}
+
+# Default backwards-compatible parameters
+GENERATION_PARAMS = dict(GENERATION_PARAMS_QUALITY)
 
 # ==============================================================================
 # Hardware & Acceleration Configuration

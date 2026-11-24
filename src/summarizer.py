@@ -38,6 +38,7 @@ from config import (
     BART_MAX_INPUT_LENGTH,
     T5_MAX_INPUT_LENGTH,
     GENERATION_PARAMS,
+    GENERATION_PRESETS,
     INFERENCE_BATCH_SIZE,
     SUMMARIES_DIR,
     get_device,
@@ -90,7 +91,30 @@ class AbstractiveSummarizer:
             f"Loading model '{self.model_name}' on {self.device} (FP16={self.use_fp16}, max_input={self.max_input_length})..."
         )
 
+        init_start = time.perf_counter()
         self._load_model_and_tokenizer()
+        self.init_time_sec = round(time.perf_counter() - init_start, 3)
+        self.inference_count = 0
+        self.cold_latency_sec: Optional[float] = None
+        self.warm_latencies: List[float] = []
+
+    def warmup(self, sample_text: Optional[str] = None) -> float:
+        """Warm up the model to trigger CUDA compilation, graph tracing, and memory paging.
+
+        Subsequent inferences will record warm-start latencies without first-run overhead.
+
+        Args:
+            sample_text (Optional[str]): Optional text to warm up with.
+
+        Returns:
+            float: Latency of the warmup run in seconds.
+        """
+        warm_text = sample_text or "This is a brief news article used for model warmup to initialize GPU kernels and caches."
+        logger.info(f"Warming up model '{self.model_name}'...")
+        res = self.summarize_text(warm_text, max_length=64, min_length=10)
+        self.cold_latency_sec = res["latency_sec"]
+        logger.info(f"Model '{self.model_name}' warm-up complete in {self.cold_latency_sec:.3f}s.")
+        return self.cold_latency_sec
 
     def _load_model_and_tokenizer(self) -> None:
         """Load pretrained tokenizer and model weights with appropriate precision."""
@@ -163,6 +187,7 @@ class AbstractiveSummarizer:
 
         start_time = time.perf_counter()
         used_cpu_fallback = False
+        is_cold = (self.inference_count == 0 and self.cold_latency_sec is None)
 
         try:
             with torch.inference_mode():
@@ -212,19 +237,29 @@ class AbstractiveSummarizer:
 
         summary_text = self.tokenizer.decode(summary_ids[0], skip_special_tokens=True).strip()
 
-        # Clean GPU cache after generation
-        if self.is_cuda:
-            del inputs, summary_ids
-            torch.cuda.empty_cache()
+        # Update cold vs warm latency statistics
+        self.inference_count += 1
+        latency_val = round(elapsed, 3)
+        if is_cold:
+            self.cold_latency_sec = latency_val
+        else:
+            self.warm_latencies.append(latency_val)
+
+        # Retain tensor memory for caching allocator without calling empty_cache on hot path
+        del inputs, summary_ids
 
         device_str = "cpu (oom-fallback)" if used_cpu_fallback else str(self.device)
+        warm_avg = round(float(sum(self.warm_latencies) / len(self.warm_latencies)), 3) if self.warm_latencies else latency_val
 
         return {
             "summary": summary_text,
-            "latency_sec": round(elapsed, 3),
+            "latency_sec": latency_val,
             "input_tokens": input_token_count,
             "output_tokens": output_token_count,
             "device": device_str,
+            "init_time_sec": self.init_time_sec,
+            "is_cold": is_cold,
+            "warm_latency_avg": warm_avg,
         }
 
     def unload_model(self) -> None:
@@ -253,26 +288,138 @@ class AbstractiveSummarizer:
         batch_size: int = INFERENCE_BATCH_SIZE,
         **override_kwargs,
     ) -> List[Dict[str, Any]]:
-        """Summarize a sequence of documents in batches.
+        """Summarize a sequence of documents using true tokenized batch inference.
+
+        Performs vectorized padding, truncation, batch generation, and batch decoding.
+        If a CUDA OOM occurs during batch generation, it recovers gracefully by falling
+        back item-by-item rather than failing the entire batch.
 
         Args:
             texts (List[str]): List of article strings.
-            batch_size (int): Batch size (defaults to 1 for 6GB VRAM safety).
+            batch_size (int): Number of articles to process in each forward pass.
             **override_kwargs: Generation parameter overrides.
 
         Returns:
-            List[Dict[str, Any]]: List of summarization result dictionaries.
+            List[Dict[str, Any]]: Ordered list of summarization result dictionaries.
         """
-        results = []
-        total = len(texts)
+        if not texts:
+            return []
 
-        for i in range(0, total, batch_size):
-            batch_texts = texts[i : i + batch_size]
-            for text in batch_texts:
-                res = self.summarize_text(text, **override_kwargs)
-                results.append(res)
-                if (len(results)) % 10 == 0 or len(results) == total:
-                    logger.info(f"Summarized {len(results)}/{total} documents...")
+        gen_params = dict(self.generation_params)
+        gen_params.update(override_kwargs)
+
+        total = len(texts)
+        results: List[Optional[Dict[str, Any]]] = [None] * total
+
+        for chunk_start in range(0, total, batch_size):
+            chunk_indices = list(range(chunk_start, min(chunk_start + batch_size, total)))
+            valid_sub_indices = []
+            valid_prepared_texts = []
+
+            for rel_idx, idx in enumerate(chunk_indices):
+                raw_text = texts[idx]
+                if raw_text and raw_text.strip():
+                    valid_sub_indices.append(rel_idx)
+                    valid_prepared_texts.append(self._prepare_input_text(raw_text))
+                else:
+                    results[idx] = {
+                        "summary": "",
+                        "latency_sec": 0.0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "device": str(self.device),
+                        "init_time_sec": self.init_time_sec,
+                        "is_cold": False,
+                    }
+
+            if not valid_prepared_texts:
+                continue
+
+            try:
+                # Vectorized batch tokenization with dynamic padding
+                batch_inputs = self.tokenizer(
+                    valid_prepared_texts,
+                    max_length=self.max_input_length,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt",
+                ).to(self.device)
+
+                if self.is_cuda:
+                    torch.cuda.synchronize(self.device)
+                batch_start = time.perf_counter()
+
+                with torch.inference_mode():
+                    batch_summary_ids = self.model.generate(
+                        batch_inputs["input_ids"],
+                        attention_mask=batch_inputs.get("attention_mask"),
+                        **gen_params,
+                    )
+
+                if self.is_cuda:
+                    torch.cuda.synchronize(self.device)
+                batch_elapsed = time.perf_counter() - batch_start
+                per_item_latency = round(batch_elapsed / len(valid_prepared_texts), 3)
+
+                # Batch decoding
+                batch_summaries = self.tokenizer.batch_decode(
+                    batch_summary_ids, skip_special_tokens=True
+                )
+
+                for k, sub_idx in enumerate(valid_sub_indices):
+                    global_idx = chunk_indices[sub_idx]
+                    if "attention_mask" in batch_inputs:
+                        in_toks = int(batch_inputs["attention_mask"][k].sum().item())
+                    else:
+                        in_toks = int(batch_inputs["input_ids"][k].shape[0])
+                    pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else -100
+                    out_toks = int((batch_summary_ids[k] != pad_id).sum().item())
+
+                    results[global_idx] = {
+                        "summary": batch_summaries[k].strip(),
+                        "latency_sec": per_item_latency,
+                        "input_tokens": in_toks,
+                        "output_tokens": out_toks,
+                        "device": str(self.device),
+                        "init_time_sec": self.init_time_sec,
+                        "is_cold": False,
+                    }
+                    self.inference_count += 1
+                    self.warm_latencies.append(per_item_latency)
+
+                del batch_inputs, batch_summary_ids
+
+            except torch.cuda.OutOfMemoryError:
+                logger.warning(
+                    f"CUDA OOM during batch generation (size {len(valid_prepared_texts)}). "
+                    "Clearing GPU cache and falling back to sequential item processing..."
+                )
+                torch.cuda.empty_cache()
+                for sub_idx in valid_sub_indices:
+                    global_idx = chunk_indices[sub_idx]
+                    results[global_idx] = self.summarize_text(texts[global_idx], **override_kwargs)
+
+            except Exception as batch_err:
+                logger.error(
+                    f"Batch generation exception: {batch_err}. Falling back to single-text inference."
+                )
+                for sub_idx in valid_sub_indices:
+                    global_idx = chunk_indices[sub_idx]
+                    try:
+                        results[global_idx] = self.summarize_text(texts[global_idx], **override_kwargs)
+                    except Exception as single_err:
+                        results[global_idx] = {
+                            "summary": f"[Error: {str(single_err)}]",
+                            "latency_sec": 0.0,
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "device": str(self.device),
+                            "error": str(single_err),
+                        }
+
+            done_count = sum(1 for r in results if r is not None)
+            if done_count % 10 == 0 or done_count == total:
+                logger.info(f"Summarized {done_count}/{total} documents...")
 
         return results
 
@@ -336,21 +483,39 @@ class AbstractiveSummarizer:
 def get_summarizer(
     model_type: str = "bart",
     device: Optional[torch.device] = None,
+    generation_params: Optional[Dict[str, Any]] = None,
+    preset: Optional[str] = None,
 ) -> AbstractiveSummarizer:
     """Factory function to instantiate BART or T5 summarizer.
 
     Args:
         model_type (str): 'bart' for facebook/bart-large-cnn, 't5' for google-t5/t5-small.
         device (Optional[torch.device]): Target compute device.
+        generation_params (Optional[Dict[str, Any]]): Custom generation parameters.
+        preset (Optional[str]): Optional preset name ('quality' or 'fast').
 
     Returns:
         AbstractiveSummarizer: Configured summarizer instance.
     """
+    params = {}
+    if preset and preset in GENERATION_PRESETS:
+        params.update(GENERATION_PRESETS[preset])
+    if generation_params:
+        params.update(generation_params)
+
     model_type_clean = model_type.lower().strip()
     if model_type_clean == "bart":
-        return AbstractiveSummarizer(model_name=PRIMARY_MODEL_NAME, device=device)
+        return AbstractiveSummarizer(
+            model_name=PRIMARY_MODEL_NAME,
+            device=device,
+            generation_params=params if params else None,
+        )
     elif model_type_clean == "t5":
-        return AbstractiveSummarizer(model_name=ALTERNATIVE_MODEL_NAME, device=device)
+        return AbstractiveSummarizer(
+            model_name=ALTERNATIVE_MODEL_NAME,
+            device=device,
+            generation_params=params if params else None,
+        )
     else:
         raise ValueError(f"Unknown model_type '{model_type}'. Choose 'bart' or 't5'.")
 

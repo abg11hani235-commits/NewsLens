@@ -37,8 +37,15 @@ from src.preprocessing import clean_text, ensure_nltk_resources
 
 logger = logging.getLogger("extractive")
 
-# Initialize NLTK tokenizer resources on import
-ensure_nltk_resources()
+_NLTK_CHECKED = False
+
+
+def _ensure_nltk_ready() -> None:
+    """Lazy check to ensure NLTK resources are available without slowing down module import."""
+    global _NLTK_CHECKED
+    if not _NLTK_CHECKED:
+        ensure_nltk_resources()
+        _NLTK_CHECKED = True
 
 
 def split_into_sentences(text: str) -> List[str]:
@@ -51,6 +58,8 @@ def split_into_sentences(text: str) -> List[str]:
         List[str]: List of sentence strings.
     """
     import re
+
+    _ensure_nltk_ready()
     try:
         sentences = nltk.sent_tokenize(text)
         if sentences:
@@ -123,21 +132,22 @@ def textrank_summarize(
     num_sentences: int = TEXTRANK_NUM_SENTENCES,
     damping: float = TEXTRANK_DAMPING,
     similarity_threshold: float = 0.05,
+    max_candidate_sentences: Optional[int] = 50,
 ) -> str:
     """Generate an extractive summary using graph-based TextRank algorithm.
 
-    Steps:
-    1. Sentence tokenization via NLTK.
-    2. Pairwise similarity matrix via TF-IDF cosine similarity.
-    3. Graph construction with NetworkX.
-    4. PageRank scoring.
-    5. Selection of top-ranked sentences and sorting by original document order.
+    Optimized for high-performance and safety:
+    - Caps initial candidate sentences to prevent O(N^2) explosion on very long documents.
+    - Uses vectorized cosine similarity via L2-normalized TF-IDF dot products.
+    - Constructs the NetworkX graph directly from the thresholded NumPy adjacency matrix.
+    - Re-sorts top-ranked sentences chronologically to preserve narrative coherence.
 
     Args:
         text (str): Input article text.
         num_sentences (int): Target number of sentences for summary.
         damping (float): PageRank damping factor (default 0.85).
         similarity_threshold (float): Minimum similarity weight to add an edge.
+        max_candidate_sentences (Optional[int]): Maximum leading sentences to evaluate (default 50).
 
     Returns:
         str: Extracted summary with original sentence sequence preserved.
@@ -155,24 +165,25 @@ def textrank_summarize(
     if n <= num_sentences:
         return " ".join(sentences)
 
-    sim_matrix = build_sentence_similarity_matrix(sentences)
+    # Cap candidate sentences for performance on long documents
+    if max_candidate_sentences is not None and n > max_candidate_sentences:
+        candidate_sentences = sentences[:max_candidate_sentences]
+        k = len(candidate_sentences)
+    else:
+        candidate_sentences = sentences
+        k = n
 
-    # Construct NetworkX graph
-    graph = nx.Graph()
-    for i in range(n):
-        graph.add_node(i)
+    sim_matrix = build_sentence_similarity_matrix(candidate_sentences)
 
-    edge_count = 0
-    for i in range(n):
-        for j in range(i + 1, n):
-            weight = sim_matrix[i, j]
-            if weight > similarity_threshold:
-                graph.add_edge(i, j, weight=float(weight))
-                edge_count += 1
+    # Filter similarity matrix by threshold to prune sparse/weak edges
+    filtered_sim = np.where(sim_matrix > similarity_threshold, sim_matrix, 0.0)
 
-    # Fallback if graph is completely disconnected
-    if edge_count == 0:
+    # Fallback to Lead-N if graph is completely disconnected
+    if not np.any(filtered_sim):
         return lead_n_summarize(text, num_sentences=num_sentences)
+
+    # Vectorized graph construction from adjacency matrix
+    graph = nx.from_numpy_array(filtered_sim)
 
     try:
         scores = nx.pagerank(graph, alpha=damping, weight="weight", max_iter=200)
@@ -189,7 +200,7 @@ def textrank_summarize(
     # Re-sort top indices chronologically to preserve discourse flow
     top_indices.sort()
 
-    selected_sentences = [sentences[idx] for idx in top_indices]
+    selected_sentences = [candidate_sentences[idx] for idx in top_indices]
     return " ".join(selected_sentences)
 
 

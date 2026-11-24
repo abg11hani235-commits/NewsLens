@@ -15,6 +15,8 @@ import gc
 import time
 import inspect
 import logging
+import threading
+from collections import OrderedDict
 from typing import Dict, Any, Tuple, Optional, List
 from pathlib import Path
 
@@ -44,65 +46,133 @@ logging.basicConfig(
 )
 logger = logging.getLogger("newslens_app")
 
-# Ensure NLTK resources
-ensure_nltk_resources()
-
 # ==============================================================================
-# Model Manager (Memory-Conscious Singleton & Lazy Loading)
+# Model Manager (Thread-Safe, Cached & Memory-Budgeted)
 # ==============================================================================
 
 class ModelManager:
-    """Manages active neural summarization models with lazy loading and memory deallocation.
+    """Thread-safe manager for neural summarization models with safe caching and resource management.
 
-    Ensures that BART and T5 are never resident simultaneously in memory, protecting
-    6GB VRAM GPUs and 16GB CPU cloud hosting environments from OOM crashes.
+    Key Features:
+    - Thread-safe model acquisition and eviction via reentrant locks (threading.RLock).
+    - Separation of model initialization/loading time from inference time.
+    - Cold-start and warm-start latency tracking.
+    - Memory-aware eviction (default max_cached_models=1 for constrained 6GB VRAM/cloud environments).
+    - Automatic warmup support.
     """
 
-    def __init__(self):
-        self.active_model_name: Optional[str] = None
-        self.active_summarizer: Optional[AbstractiveSummarizer] = None
+    def __init__(self, max_cached_models: int = 1):
+        self.max_cached_models = max_cached_models
+        self._lock = threading.RLock()
+        self._cache: "OrderedDict[str, AbstractiveSummarizer]" = OrderedDict()
+        self._last_loaded_metadata: Dict[str, Any] = {}
 
-    def get_model(self, model_choice: str) -> AbstractiveSummarizer:
-        """Retrieve the requested summarizer, unloading any conflicting model.
+    @property
+    def active_model_name(self) -> Optional[str]:
+        with self._lock:
+            if self._cache:
+                return next(reversed(self._cache))
+            return None
+
+    @active_model_name.setter
+    def active_model_name(self, value: Optional[str]) -> None:
+        pass
+
+    @property
+    def active_summarizer(self) -> Optional[AbstractiveSummarizer]:
+        with self._lock:
+            if self._cache:
+                return self._cache[next(reversed(self._cache))]
+            return None
+
+    @active_summarizer.setter
+    def active_summarizer(self, value: Optional[AbstractiveSummarizer]) -> None:
+        pass
+
+    def get_model(
+        self,
+        model_choice: str,
+        warmup: bool = False,
+    ) -> AbstractiveSummarizer:
+        """Retrieve the requested summarizer, ensuring thread safety and memory safety.
 
         Args:
             model_choice (str): 'bart' or 't5'.
+            warmup (bool): Whether to perform model warmup if loaded from scratch.
 
         Returns:
-            AbstractiveSummarizer: Configured and ready model instance.
+            AbstractiveSummarizer: Ready-to-use summarizer instance.
+        """
+        summarizer, _ = self.get_model_with_metadata(model_choice, warmup=warmup)
+        return summarizer
+
+    def get_model_with_metadata(
+        self,
+        model_choice: str,
+        warmup: bool = False,
+    ) -> Tuple[AbstractiveSummarizer, Dict[str, Any]]:
+        """Retrieve model along with loading and cache metadata.
+
+        Returns:
+            Tuple[AbstractiveSummarizer, Dict[str, Any]]: (model, metadata_dict)
         """
         model_key = model_choice.lower().strip()
         if model_key not in ["bart", "t5"]:
             raise ValueError(f"Invalid model choice '{model_choice}'. Choose 'bart' or 't5'.")
 
-        target_model_name = PRIMARY_MODEL_NAME if model_key == "bart" else ALTERNATIVE_MODEL_NAME
+        with self._lock:
+            # Check if model is already in cache
+            if model_key in self._cache:
+                summarizer = self._cache[model_key]
+                self._cache.move_to_end(model_key)
+                meta = {
+                    "model_key": model_key,
+                    "is_cached": True,
+                    "load_time_sec": 0.0,
+                    "init_time_sec": getattr(summarizer, "init_time_sec", 0.0),
+                    "is_warmed": summarizer.cold_latency_sec is not None,
+                }
+                self._last_loaded_metadata = meta
+                return summarizer, meta
 
-        # If already loaded and active, return cached instance
-        if self.active_summarizer is not None and self.active_model_name == model_key:
-            return self.active_summarizer
+            # Evict least recently used model if capacity reached
+            while len(self._cache) >= self.max_cached_models:
+                evicted_key, evicted_model = self._cache.popitem(last=False)
+                logger.info(f"Evicting active model '{evicted_key}' to free memory...")
+                evicted_model.unload_model()
 
-        # Unload any previously loaded model to preserve memory
-        if self.active_summarizer is not None:
-            logger.info(f"Evicting active model '{self.active_model_name}' to free memory...")
-            self.active_summarizer.unload_model()
-            self.active_summarizer = None
-            self.active_model_name = None
+            target_model_name = PRIMARY_MODEL_NAME if model_key == "bart" else ALTERNATIVE_MODEL_NAME
+            logger.info(f"Loading '{target_model_name}' on demand...")
 
-        logger.info(f"Loading '{target_model_name}' on demand...")
-        summarizer = AbstractiveSummarizer(
-            model_name=target_model_name,
-            device=get_device(),
-        )
-        self.active_model_name = model_key
-        self.active_summarizer = summarizer
-        return self.active_summarizer
+            load_start = time.perf_counter()
+            summarizer = AbstractiveSummarizer(
+                model_name=target_model_name,
+                device=get_device(),
+            )
+            load_elapsed = round(time.perf_counter() - load_start, 3)
+
+            if warmup:
+                summarizer.warmup()
+
+            self._cache[model_key] = summarizer
+            meta = {
+                "model_key": model_key,
+                "is_cached": False,
+                "load_time_sec": load_elapsed,
+                "init_time_sec": summarizer.init_time_sec,
+                "is_warmed": summarizer.cold_latency_sec is not None,
+            }
+            self._last_loaded_metadata = meta
+            return summarizer, meta
 
     def unload_all(self) -> None:
-        """Unload active model completely."""
-        if self.active_summarizer is not None:
-            self.active_summarizer.unload_model()
-            self.active_summarizer = None
-            self.active_model_name = None
+        """Unload all active models completely and release resources."""
+        with self._lock:
+            for key, model in list(self._cache.items()):
+                logger.info(f"Unloading model '{key}'...")
+                model.unload_model()
+            self._cache.clear()
+            self._last_loaded_metadata = {}
 
 
 # Global singleton instance
@@ -165,7 +235,7 @@ def summarize_article(
     """Execute summarization for single document based on model selection.
 
     Returns:
-        Tuple: (Summary Text, Latency String, Device String, Word Count String, Compression Ratio String)
+        Tuple: (Summary Text, Latency/Load String, Device String, Word Count String, Compression Ratio String)
     """
     if not article_text or not article_text.strip():
         raise gr.Error("Please provide an article to summarize.")
@@ -184,15 +254,17 @@ def summarize_article(
             summary = lead_n_summarize(cleaned, num_sentences=num_sentences)
             elapsed = time.perf_counter() - t0
             device = "CPU (Heuristic)"
+            latency_display = f"{elapsed:.3f} seconds (Extractive Heuristic)"
 
         elif "textrank" in model_clean:
             t0 = time.perf_counter()
             summary = textrank_summarize(cleaned, num_sentences=num_sentences)
             elapsed = time.perf_counter() - t0
             device = "CPU (PageRank Graph)"
+            latency_display = f"{elapsed:.3f} seconds (Graph PageRank)"
 
         elif "bart" in model_clean:
-            summarizer = MODEL_MANAGER.get_model("bart")
+            summarizer, meta = MODEL_MANAGER.get_model_with_metadata("bart")
             res = summarizer.summarize_text(
                 cleaned,
                 max_length=max_length,
@@ -202,9 +274,16 @@ def summarize_article(
             summary = res["summary"]
             elapsed = res["latency_sec"]
             device = res["device"]
+            load_time = meta["load_time_sec"]
+            is_cached = meta["is_cached"]
+            is_cold = res.get("is_cold", False)
+
+            load_str = "Load: 0.00s (Cached)" if is_cached else f"Load: {load_time:.2f}s (Cold)"
+            lat_type = "Cold" if is_cold else "Warm"
+            latency_display = f"{elapsed:.3f}s ({lat_type} Inference) | {load_str}"
 
         elif "t5" in model_clean:
-            summarizer = MODEL_MANAGER.get_model("t5")
+            summarizer, meta = MODEL_MANAGER.get_model_with_metadata("t5")
             res = summarizer.summarize_text(
                 cleaned,
                 max_length=max_length,
@@ -214,6 +293,13 @@ def summarize_article(
             summary = res["summary"]
             elapsed = res["latency_sec"]
             device = res["device"]
+            load_time = meta["load_time_sec"]
+            is_cached = meta["is_cached"]
+            is_cold = res.get("is_cold", False)
+
+            load_str = "Load: 0.00s (Cached)" if is_cached else f"Load: {load_time:.2f}s (Cold)"
+            lat_type = "Cold" if is_cold else "Warm"
+            latency_display = f"{elapsed:.3f}s ({lat_type} Inference) | {load_str}"
 
         else:
             raise gr.Error(f"Unsupported model: {model_choice}")
@@ -221,7 +307,6 @@ def summarize_article(
         out_words = len(summary.split())
         ratio = round(input_words / max(out_words, 1), 1)
 
-        latency_display = f"{elapsed:.3f} seconds"
         word_count_display = f"{out_words} words (Original: {input_words} words)"
         ratio_display = f"{ratio}x Compression"
 
@@ -266,7 +351,7 @@ def compare_all_models(
     textrank_lat = time.perf_counter() - t0
 
     # 3. T5-Small (Lazy load, run, then unload before BART)
-    t5_model = MODEL_MANAGER.get_model("t5")
+    t5_model, t5_meta = MODEL_MANAGER.get_model_with_metadata("t5")
     t5_res = t5_model.summarize_text(
         cleaned,
         max_length=max_length,
@@ -276,9 +361,10 @@ def compare_all_models(
     t5_sum = t5_res["summary"]
     t5_lat = t5_res["latency_sec"]
     t5_dev = t5_res["device"]
+    t5_status = "Cached" if t5_meta["is_cached"] else f"{t5_meta['load_time_sec']:.2f}s Load"
 
     # 4. BART-Large-CNN (ModelManager evicts T5 to avoid memory conflict)
-    bart_model = MODEL_MANAGER.get_model("bart")
+    bart_model, bart_meta = MODEL_MANAGER.get_model_with_metadata("bart")
     bart_res = bart_model.summarize_text(
         cleaned,
         max_length=max_length,
@@ -288,15 +374,16 @@ def compare_all_models(
     bart_sum = bart_res["summary"]
     bart_lat = bart_res["latency_sec"]
     bart_dev = bart_res["device"]
+    bart_status = "Cached" if bart_meta["is_cached"] else f"{bart_meta['load_time_sec']:.2f}s Load"
 
     # Construct comparison summary table
     table_md = f"""
-| Architecture | Paradigm | Parameters | Latency | Summary Words | Compression | Device |
-|---|---|---|---|---|---|---|
-| **Lead-3** | Extractive Heuristic | N/A | {lead3_lat:.3f}s | {len(lead3_sum.split())} words | {input_words/max(len(lead3_sum.split()),1):.1f}x | CPU |
-| **TextRank** | Extractive Graph | N/A | {textrank_lat:.3f}s | {len(textrank_sum.split())} words | {input_words/max(len(textrank_sum.split()),1):.1f}x | CPU |
-| **T5-Small** | Abstractive Transformer | 60M | {t5_lat:.3f}s | {len(t5_sum.split())} words | {input_words/max(len(t5_sum.split()),1):.1f}x | {t5_dev} |
-| **BART-Large-CNN** | Abstractive Transformer | 406M | {bart_lat:.3f}s | {len(bart_sum.split())} words | {input_words/max(len(bart_sum.split()),1):.1f}x | {bart_dev} |
+| Architecture | Paradigm | Parameters | Inference Latency | Model Load Status | Summary Words | Compression | Device |
+|---|---|---|---|---|---|---|---|
+| **Lead-3** | Extractive Heuristic | N/A | {lead3_lat:.3f}s | Instant (Heuristic) | {len(lead3_sum.split())} words | {input_words/max(len(lead3_sum.split()),1):.1f}x | CPU |
+| **TextRank** | Extractive Graph | N/A | {textrank_lat:.3f}s | Instant (Graph) | {len(textrank_sum.split())} words | {input_words/max(len(textrank_sum.split()),1):.1f}x | CPU |
+| **T5-Small** | Abstractive Transformer | 60M | {t5_lat:.3f}s | {t5_status} | {len(t5_sum.split())} words | {input_words/max(len(t5_sum.split()),1):.1f}x | {t5_dev} |
+| **BART-Large-CNN** | Abstractive Transformer | 406M | {bart_lat:.3f}s | {bart_status} | {len(bart_sum.split())} words | {input_words/max(len(bart_sum.split()),1):.1f}x | {bart_dev} |
 """
     return lead3_sum, textrank_sum, t5_sum, bart_sum, table_md
 

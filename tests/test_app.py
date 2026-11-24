@@ -133,3 +133,53 @@ class TestModelManager:
         assert mgr.active_summarizer is None
         mgr.unload_all()
         assert mgr.active_summarizer is None
+
+    def test_model_manager_caching_and_metadata(self):
+        """Verify model caching metadata tracks cold vs cached access."""
+        mgr = ModelManager(max_cached_models=1)
+        model1, meta1 = mgr.get_model_with_metadata("t5")
+        assert meta1["is_cached"] is False
+        assert meta1["load_time_sec"] >= 0.0
+        assert meta1["model_key"] == "t5"
+
+        # Second access must be cached with 0.0s load time
+        model2, meta2 = mgr.get_model_with_metadata("t5")
+        assert meta2["is_cached"] is True
+        assert meta2["load_time_sec"] == 0.0
+        assert model1 is model2
+
+        mgr.unload_all()
+        assert mgr.active_summarizer is None
+
+    def test_model_manager_thread_safety(self):
+        """Verify thread-safe concurrent model acquisition."""
+        import concurrent.futures
+
+        mgr = ModelManager(max_cached_models=1)
+
+        def worker():
+            model = mgr.get_model("t5")
+            return id(model)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(worker) for _ in range(6)]
+            results = [f.result() for f in futures]
+
+        # All concurrent threads must receive the same valid model instance
+        assert len(set(results)) == 1
+
+        mgr.unload_all()
+
+
+class TestCompareModels:
+    """Tests for multi-model side-by-side comparison."""
+
+    def test_compare_models_empty_rejected(self):
+        """Verify empty input is rejected with gr.Error."""
+        with pytest.raises(gr.Error, match="Please provide an article"):
+            compare_all_models("")
+
+    def test_compare_models_short_rejected(self):
+        """Verify input with fewer than 10 words is rejected."""
+        with pytest.raises(gr.Error, match="Article text is too short"):
+            compare_all_models("Too short text.")

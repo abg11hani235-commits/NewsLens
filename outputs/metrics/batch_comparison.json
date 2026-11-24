@@ -1,0 +1,8 @@
+{
+  "num_documents": 4,
+  "sequential_total_sec": 2.2345,
+  "batch_total_sec": 0.5967,
+  "sequential_per_doc_sec": 0.5586,
+  "batch_per_doc_sec": 0.1492,
+  "speedup_factor": 3.74
+}

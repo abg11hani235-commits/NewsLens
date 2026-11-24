@@ -68,3 +68,22 @@ def test_textrank_preserves_sentence_order():
 
     indices = [original_sentences.index(s) for s in extracted if s in original_sentences]
     assert indices == sorted(indices)
+
+
+def test_textrank_candidate_sentence_capping():
+    """Verify that candidate capping restricts evaluation pool to the first N sentences."""
+    many_sentences = [f"Sentence number {i} discusses specific scientific findings." for i in range(1, 50)]
+    text = " ".join(many_sentences)
+    summary = textrank_summarize(text, num_sentences=3, max_candidate_sentences=10)
+    assert len(summary) > 0
+    # Should only pull from the first 10 sentences
+    for i in range(11, 50):
+        assert f"Sentence number {i} discusses" not in summary
+
+
+def test_textrank_disconnected_fallback():
+    """Verify fallback to Lead-N when no edges exceed similarity threshold."""
+    text = "Apples are delicious fruits. Quantum entanglement occurs in particles. Ancient Roman architecture was stone."
+    summary = textrank_summarize(text, num_sentences=2, similarity_threshold=0.99)
+    assert len(summary) > 0
+    assert summary.startswith("Apples are delicious fruits")

@@ -21,7 +21,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import pandas as pd
 import nltk
-from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from config import (
     RAW_TRAIN_FILE,
@@ -36,16 +35,25 @@ from config import (
 
 logger = logging.getLogger("preprocessing")
 
+_NLTK_CHECKED = False
 
-def ensure_nltk_resources() -> bool:
+
+def ensure_nltk_resources(quiet: bool = True) -> bool:
     """Independently verify and ensure NLTK sentence tokenization resources are available.
 
     Checks 'punkt' and 'punkt_tab' separately without unnecessary network requests.
     Falls back gracefully if offline or in a restricted deployment environment.
 
+    Args:
+        quiet (bool): Suppress repeated checks.
+
     Returns:
         bool: True if NLTK resources are available, False if fallback should be used.
     """
+    global _NLTK_CHECKED
+    if _NLTK_CHECKED:
+        return True
+
     resources = ["tokenizers/punkt", "tokenizers/punkt_tab"]
     all_available = True
 
@@ -54,7 +62,7 @@ def ensure_nltk_resources() -> bool:
             nltk.data.find(res)
         except LookupError:
             pkg_name = res.split("/")[-1]
-            logger.info(f"NLTK resource '{res}' not found locally. Attempting download...")
+            logger.info(f"NLTK resource '{res}' not found locally. Attempting quiet download...")
             try:
                 downloaded = nltk.download(pkg_name, quiet=True)
                 if not downloaded:
@@ -64,11 +72,8 @@ def ensure_nltk_resources() -> bool:
                 logger.warning(f"Network error during NLTK download of '{pkg_name}': {e}")
                 all_available = False
 
+    _NLTK_CHECKED = all_available
     return all_available
-
-
-# Ensure NLTK resources at module import
-_NLTK_READY = ensure_nltk_resources()
 
 
 def clean_text(text: Optional[str]) -> str:
@@ -170,6 +175,7 @@ def get_text_length_info(text: str) -> Dict[str, int]:
     chars = len(text)
     words = len(text.split())
     try:
+        ensure_nltk_resources()
         sentences = len(nltk.sent_tokenize(text))
     except Exception:
         # Fallback simple sentence split if NLTK fails
@@ -184,7 +190,7 @@ def get_text_length_info(text: str) -> Dict[str, int]:
 
 def tokenize_for_model(
     text: str,
-    tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
+    tokenizer: Any,
     max_length: Optional[int] = None,
     padding: Union[bool, str] = False,
     truncation: bool = True,

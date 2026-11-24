@@ -3,6 +3,7 @@
 Contains both lightweight unit tests and real model inference verification tests.
 """
 
+from unittest.mock import patch, MagicMock
 import pytest
 import torch
 from src.summarizer import get_summarizer, AbstractiveSummarizer
@@ -34,6 +35,15 @@ def test_summarize_empty_text():
     assert res["input_tokens"] == 0
 
 
+def test_get_summarizer_presets():
+    """Verify generation presets ('fast' vs 'quality')."""
+    fast_t5 = get_summarizer("t5", preset="fast")
+    assert fast_t5.generation_params.get("num_beams") == 1
+
+    quality_t5 = get_summarizer("t5", preset="quality")
+    assert quality_t5.generation_params.get("num_beams") == 4
+
+
 # ==============================================================================
 # Real Model Inference Tests (Executed on Cached Models)
 # ==============================================================================
@@ -52,6 +62,45 @@ def test_summarize_real_t5():
     assert res["input_tokens"] > 0
     assert res["output_tokens"] > 0
     assert res["latency_sec"] > 0
+
+
+def test_summarize_batch_true_batching():
+    """Verify true vectorized batch inference, order preservation, and empty handling."""
+    summarizer = get_summarizer("t5")
+    articles = [
+        "First article discusses renewable energy expansion across western European nations in great detail.",
+        "",  # Empty article should be safely handled
+        "Third article analyzes quantum computing breakthroughs and hardware cooling systems.",
+    ]
+    batch_res = summarizer.summarize_batch(articles, batch_size=2, max_length=40, min_length=5)
+    assert len(batch_res) == 3
+    assert len(batch_res[0]["summary"]) > 0
+    assert batch_res[1]["summary"] == ""
+    assert batch_res[1]["latency_sec"] == 0.0
+    assert len(batch_res[2]["summary"]) > 0
+
+
+def test_summarize_warmup_and_latency_tracking():
+    """Verify model warmup and cold vs warm latency tracking."""
+    summarizer = get_summarizer("t5")
+    warmup_lat = summarizer.warmup()
+    assert warmup_lat > 0.0
+    assert summarizer.cold_latency_sec is not None
+
+    sample = "Autonomous systems and robotics are transforming manufacturing logistics globally."
+    res = summarizer.summarize_text(sample, max_length=40, min_length=5)
+    assert res["is_cold"] is False
+    assert len(summarizer.warm_latencies) >= 1
+
+
+def test_summarize_very_long_input():
+    """Verify that very long articles are safely truncated without error."""
+    summarizer = get_summarizer("t5")
+    long_article = "Technological innovation accelerates development. " * 300  # ~900 words
+    res = summarizer.summarize_text(long_article, max_length=50, min_length=10)
+    assert isinstance(res["summary"], str)
+    assert len(res["summary"]) > 0
+    assert res["input_tokens"] <= summarizer.max_input_length
 
 
 def test_summarize_real_bart():

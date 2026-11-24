@@ -33,11 +33,6 @@ from config import (
     SUMMARIES_DIR,
     METRICS_DIR,
 )
-from src.preprocessing import clean_text, load_processed_split, preprocess_and_save_all_splits
-from src.extractive import lead_n_summarize, textrank_summarize
-from src.summarizer import get_summarizer
-from src.evaluation import run_full_benchmark, compute_rouge_metrics
-from src.visualization import perform_full_eda
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +43,8 @@ logger = logging.getLogger("main")
 
 def handle_summarize(args: argparse.Namespace) -> None:
     """Handle abstractive summarization CLI request."""
+    from src.summarizer import get_summarizer
+    from src.preprocessing import load_processed_split
     if args.sample_size <= 0:
         logger.error(f"Invalid sample_size ({args.sample_size}). Must be > 0.")
         sys.exit(1)
@@ -99,6 +96,9 @@ def handle_summarize(args: argparse.Namespace) -> None:
 
 def handle_extractive(args: argparse.Namespace) -> None:
     """Handle extractive summarization CLI request."""
+    from src.preprocessing import clean_text, load_processed_split
+    from src.extractive import lead_n_summarize, textrank_summarize
+
     if args.num_sentences <= 0:
         logger.error(f"Invalid num_sentences ({args.num_sentences}). Must be > 0.")
         sys.exit(1)
@@ -148,6 +148,8 @@ def handle_extractive(args: argparse.Namespace) -> None:
 
 def handle_evaluate(args: argparse.Namespace) -> None:
     """Handle benchmark evaluation CLI request."""
+    from src.evaluation import run_full_benchmark
+
     if args.sample_size <= 0:
         logger.error(f"Invalid sample_size ({args.sample_size}). Must be > 0.")
         sys.exit(1)
@@ -225,8 +227,10 @@ def main() -> None:
     elif args.mode == "evaluate":
         handle_evaluate(args)
     elif args.mode == "eda":
+        from src.visualization import perform_full_eda
         perform_full_eda()
     elif args.mode == "preprocess":
+        from src.preprocessing import preprocess_and_save_all_splits
         preprocess_and_save_all_splits(force=args.force)
     elif args.mode in ["app", "web"]:
         from app import launch_app

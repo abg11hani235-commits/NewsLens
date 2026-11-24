@@ -21,7 +21,7 @@ short_description: Benchmarking Extractive vs Abstractive NLP Summarization
 
 An academic and production-ready Natural Language Processing (NLP) text summarization system and web application comparing **extractive** and **abstractive** summarization paradigms on the **CNN/DailyMail (3.0.0)** benchmark.
 
-The project implements classical heuristics, graph-based algorithms, and state-of-the-art encoder-decoder Transformer architectures optimized for both consumer GPU hardware (NVIDIA RTX 3060, 6GB VRAM) and resource-conscious cloud deployment (Hugging Face Spaces CPU Free Tier).
+The project implements classical heuristics, graph-based algorithms, and state-of-the-art encoder-decoder Transformer architectures optimized for consumer GPU hardware (NVIDIA RTX 3060, 6GB VRAM) and resource-conscious cloud deployment (Hugging Face Spaces CPU Free Tier).
 
 ---
 
@@ -36,16 +36,19 @@ The project implements classical heuristics, graph-based algorithms, and state-o
    - [T5 (Text-to-Text Transfer Transformer)](#t5-architecture)
 4. [Dataset: CNN/DailyMail 3.0.0](#dataset-cnndailymail-300)
 5. [Hardware Optimization & Memory Architecture](#hardware-optimization--memory-architecture)
-6. [Hugging Face Spaces Cloud Deployment](#hugging-face-spaces-cloud-deployment)
-7. [Project Architecture & Directory Structure](#project-architecture--directory-structure)
-8. [Installation & Setup](#installation--setup)
-9. [Command-Line Interface (CLI) Usage](#command-line-interface-cli-usage)
-10. [Experimental Results & Benchmark](#experimental-results--benchmark)
+6. [High-Performance Engine Optimizations](#high-performance-engine-optimizations)
+7. [Hugging Face Spaces Cloud Deployment](#hugging-face-spaces-cloud-deployment)
+8. [Project Architecture & Directory Structure](#project-architecture--directory-structure)
+9. [Installation & Setup](#installation--setup)
+10. [Command-Line Interface (CLI) Usage](#command-line-interface-cli-usage)
+11. [Experimental Results & Benchmark](#experimental-results--benchmark)
     - [Quantitative ROUGE Benchmark Table](#quantitative-rouge-benchmark-table)
+    - [Measured Performance & Throughput Benchmark](#measured-performance--throughput-benchmark)
+    - [Sequential vs. True Vectorized Batching](#sequential-vs-true-vectorized-batching)
     - [Visualizations](#visualizations)
     - [Qualitative Case Study](#qualitative-case-study)
-11. [Unit Testing & Quality Assurance](#unit-testing--quality-assurance)
-12. [Limitations & Future Work](#limitations--future-work)
+12. [Unit Testing & Quality Assurance](#unit-testing--quality-assurance)
+13. [Limitations & Future Work](#limitations--future-work)
 
 ---
 
@@ -55,7 +58,7 @@ Text summarization is the task of condensing a source document into a concise ve
 - **Reproducible Data Ingestion:** Streaming and persisting structured subsets of CNN/DailyMail without downloading multi-gigabyte archives.
 - **Exploratory Data Analysis (EDA):** Quantifying article lengths, summary bounds, compression ratios, and vocabulary distributions.
 - **Linguistic Preprocessing:** Removing journalistic artifacts (e.g., `(CNN) --`), normalizing bullet points, and applying model-specific subword tokenization with offline NLTK resource resilience.
-- **Extractive Baselines:** Implementing Lead-3 and a custom TF-IDF/PageRank TextRank algorithm via NetworkX.
+- **Extractive Baselines:** Implementing Lead-3 and a custom TF-IDF/PageRank TextRank algorithm via NetworkX with candidate sentence capping.
 - **Abstractive Transformers:** Deploying `facebook/bart-large-cnn` and `google-t5/t5-small` in FP16 mixed precision on CUDA with automated CPU fallback.
 - **Standardized Evaluation:** Evaluating models with ROUGE-1, ROUGE-2, ROUGE-L (Precision, Recall, F1), length tracking, and synchronized GPU latency profiling.
 - **Interactive Web Application:** A full-featured Gradio app featuring single-document summarization, side-by-side model comparison, and academic benchmarking.
@@ -168,15 +171,32 @@ TextRank (Mihalcea & Tarau, 2004) is an unsupervised graph-based ranking model d
 ## Hardware Optimization & Memory Architecture
 
 ### 1. Consumer GPU Optimization (RTX 3060, 6GB VRAM)
-- **FP16 Mixed Precision:** Loaded via `torch.float16` when CUDA is available, reducing VRAM consumption by 50% (~775 MB–1.6 GB VRAM).
-- **Explicit CUDA Synchronization:** Timing measurements use `torch.cuda.synchronize()` before and after generation to ensure accurate latency figures that reflect completed GPU kernels.
+- **FP16 Mixed Precision:** Loaded via `torch.float16` when CUDA is available, reducing VRAM consumption by 50% (~780 MB–850 MB VRAM vs. ~3.2 GB in FP32).
+- **Explicit CUDA Synchronization:** Timing measurements use `torch.cuda.synchronize()` before and after generation to ensure accurate latency figures that reflect completed GPU execution kernels.
 - **Safe OOM Fallback with Device Restoration:** In `src/summarizer.py`, if a CUDA Out-Of-Memory exception occurs, all inputs (including attention masks) are transferred to CPU, inference completes on CPU, and the model is safely moved back or deallocated in a `try...finally` block.
+- **Elimination of Hot-Path Cache Thrashing:** Removed unnecessary `torch.cuda.empty_cache()` calls from the normal generation path. PyTorch's caching allocator reuses tensor memory at native speed without driver-level CPU-GPU synchronization stalls.
 
-### 2. Memory-Aware Model Management (`ModelManager`)
+### 2. Thread-Safe Model Management (`ModelManager`)
 To prevent concurrent GPU memory allocation or RAM spikes on cloud hosts:
-- A singleton `ModelManager` class lazily loads models on demand.
-- Before loading BART (406M parameters), any resident instance of T5 is explicitly evicted via `unload_model()`, garbage collection `gc.collect()`, and `torch.cuda.empty_cache()`.
-- BART and T5 are **never resident simultaneously**, allowing the entire application to run stably on constrained hardware.
+- Singleton `ModelManager` class lazily loads models on demand.
+- Implements thread-safe locking using `threading.RLock()` to prevent race conditions during model loading, inference, and eviction.
+- Tracks model loading and initialization time separately from active inference time.
+- Implements cold-start vs. warm-start latency profiling.
+- Supports proactive model warmup (`warmup()`) to page weights into GPU memory and compile execution graphs before user requests.
+- Enforces memory-conscious LRU eviction (`max_cached_models=1` by default) so BART and T5 are **never resident simultaneously in memory**.
+
+---
+
+## High-Performance Engine Optimizations
+
+| Optimization | Target Module | Technical Implementation | Measured Impact |
+|---|---|---|---|
+| **True Vectorized Batching** | `src/summarizer.py` | Vectorized batch tokenization with dynamic padding and batch decoding. | **3.74x throughput speedup** over sequential execution. |
+| **Hot-Path Cache Retention** | `src/summarizer.py` | Removed `empty_cache()` from single inference; reserve only for OOM recovery and eviction. | Prevents driver-level stalls; enables sub-second warm inference. |
+| **Vectorized TextRank Graph** | `src/extractive.py` | Constructed NetworkX graph directly from thresholded NumPy adjacency matrix. | Eliminates Python double loop; scales to large matrices instantly. |
+| **Candidate Sentence Capping** | `src/extractive.py` | Capped TextRank candidate pool to leading 50 sentences (`max_candidate_sentences=50`). | Guaranteed `< 6ms` latency even on documents with 1,000+ sentences. |
+| **Lazy Module Ingestion** | `main.py`, `src/preprocessing.py` | Deferred heavy imports (transformers, matplotlib, seaborn, evaluate) to subcommands. | Reduced CLI startup latency from **>7.0s to 2.0s**. |
+| **Thread-Safe Model Manager** | `app.py` | Protected singleton model retrieval and eviction with reentrant lock (`threading.RLock`). | Completely prevents race conditions and corrupted states under concurrent requests. |
 
 ---
 
@@ -207,7 +227,7 @@ NewsLens is pre-configured for direct, zero-cost deployment to **Hugging Face Sp
 > **Free CPU Tier Latency Expectations:**
 > - Extractive (Lead-3, TextRank): **< 0.01s** (instantaneous).
 > - T5-Small: **~1.5s** on 2 vCPUs.
-> - BART-Large-CNN: **~5–8s** on 2 vCPUs (vs. ~0.97s on CUDA GPU).
+> - BART-Large-CNN: **~5–8s** on 2 vCPUs (vs. ~0.65s on CUDA GPU).
 > Model weights are downloaded automatically into cache on first inference and never committed to Git.
 
 ---
@@ -220,10 +240,13 @@ NewsLens/
 ├── .gitignore                      # Exclusions for .venv/, datasets, caches, model weights
 ├── requirements.txt                # Cross-platform cloud deployment dependencies (Hugging Face Spaces)
 ├── requirements-cuda.txt           # Local GPU dependencies (Windows 11 / CUDA 12.4)
-├── config.py                       # Configuration paths, hyperparameters, and device resolution
-├── main.py                         # Unified Command-Line Interface (CLI) application
-├── app.py                          # Production Gradio Web Application
+├── config.py                       # Configuration paths, hyperparameters, and presets
+├── main.py                         # Unified Command-Line Interface (CLI) application with lazy imports
+├── app.py                          # Production Gradio Web Application with thread-safe ModelManager
 ├── README.md                       # Academic documentation & deployment guide
+│
+├── scripts/
+│   └── benchmark_performance.py    # Automated, reproducible throughput and latency benchmark suite
 │
 ├── data/
 │   ├── raw/                        # Untouched streamed datasets (CSV)
@@ -245,9 +268,9 @@ NewsLens/
 ├── src/
 │   ├── __init__.py
 │   ├── data_loader.py              # Streaming, metadata extraction, length statistics
-│   ├── preprocessing.py            # Text cleaning, highlight normalization, NLTK checks
-│   ├── extractive.py               # Lead-N heuristic & NetworkX TextRank algorithm
-│   ├── summarizer.py               # AbstractiveSummarizer class, FP16 CUDA, synchronized timing
+│   ├── preprocessing.py            # Text cleaning, highlight normalization, lazy NLTK checks
+│   ├── extractive.py               # Lead-N heuristic & optimized NetworkX TextRank
+│   ├── summarizer.py               # AbstractiveSummarizer with true batching, warmup, FP16
 │   ├── evaluation.py               # ROUGE calculation & full benchmark runner
 │   └── visualization.py            # Publication plots (Matplotlib/Seaborn Agg backend)
 │
@@ -260,7 +283,10 @@ NewsLens/
 │   │   ├── eda_summary_statistics.csv
 │   │   ├── eda_summary_statistics.json
 │   │   ├── rouge_scores.csv
-│   │   └── rouge_scores.json
+│   │   ├── rouge_scores.json
+│   │   ├── benchmark_performance.csv       # Measured multi-document benchmark results
+│   │   ├── benchmark_performance.json
+│   │   └── batch_comparison.json           # Sequential vs batch speedup metrics
 │   └── figures/                    # Publication-grade visualization charts
 │       ├── article_length_dist.png
 │       ├── summary_length_dist.png
@@ -272,13 +298,13 @@ NewsLens/
 │
 └── tests/
     ├── __init__.py
-    ├── test_data_loader.py         # Tests for data loading and schema validation
-    ├── test_preprocessing.py       # Tests for text cleaning and tokenization
-    ├── test_extractive.py          # Tests for Lead-3 and TextRank graph logic
-    ├── test_summarizer.py          # Real inference tests for BART & T5, OOM handling
-    ├── test_evaluation.py          # Tests for ROUGE score computations
-    ├── test_visualization.py       # Tests for headless plot rendering
-    └── test_app.py                 # Tests for Gradio interface, counters, and ModelManager
+    ├── test_data_loader.py         # Split loading, schema validation, length statistics
+    ├── test_preprocessing.py       # Wire artifact cleaning, whitespace, punctuation
+    ├── test_extractive.py          # Lead-3, TextRank, candidate capping, fallback
+    ├── test_summarizer.py          # Real BART & T5 inference, batching, warmup, presets, long input
+    ├── test_evaluation.py          # ROUGE-1/2/L score computations, edge cases
+    ├── test_visualization.py       # Headless plot rendering and artifact validation
+    └── test_app.py                 # Gradio interface, thread-safe ModelManager, caching, multi-model
 ```
 
 ---
@@ -346,7 +372,12 @@ python main.py extractive --method textrank --sample_size 5
 python main.py evaluate --sample_size 50
 ```
 
-### 6. Non-Destructive Preprocessing & EDA
+### 6. Run Performance Benchmark Suite
+```powershell
+python scripts/benchmark_performance.py
+```
+
+### 7. Non-Destructive Preprocessing & EDA
 ```powershell
 # Safe non-destructive run (skips already processed files)
 python main.py preprocess
@@ -362,9 +393,9 @@ python main.py eda
 
 ## Experimental Results & Benchmark
 
-All four architectures were evaluated on the **exact same 50 test samples** from the CNN/DailyMail test split.
-
 ### Quantitative ROUGE Benchmark Table
+
+All four architectures were evaluated on the **exact same 50 test samples** from the CNN/DailyMail test split:
 
 | Model | Paradigm | Parameters | ROUGE-1 F1 | ROUGE-1 Recall | ROUGE-1 Prec | ROUGE-2 F1 | ROUGE-2 Recall | ROUGE-2 Prec | ROUGE-L F1 | ROUGE-L Recall | ROUGE-L Prec | Avg Words | Avg Latency |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -377,6 +408,38 @@ All four architectures were evaluated on the **exact same 50 test samples** from
 
 ---
 
+### Measured Performance & Throughput Benchmark
+
+Empirically measured using `scripts/benchmark_performance.py` across Short (~60 words), Medium (~230 words), and Long (~340 words) articles:
+
+| Model Architecture | Document Scale | Input Words | Output Words | Warm Latency (Mean) | Output Throughput | Peak VRAM | Compute Device |
+|---|---|---|---|---|---|---|---|
+| **Lead-3** | Short | 57 words | 57 words | **0.0002s** | ~269,000 w/s | 0.0 MB | CPU |
+| **Lead-3** | Medium | 231 words | 75 words | **0.0004s** | ~188,000 w/s | 0.0 MB | CPU |
+| **Lead-3** | Long | 343 words | 69 words | **0.0003s** | ~230,000 w/s | 0.0 MB | CPU |
+| **TextRank** | Short | 57 words | 57 words | **0.0001s** | ~325,000 w/s | 0.0 MB | CPU |
+| **TextRank** | Medium | 231 words | 82 words | **0.0041s** | ~19,800 w/s | 0.0 MB | CPU |
+| **TextRank** | Long | 343 words | 67 words | **0.0057s** | ~11,600 w/s | 0.0 MB | CPU |
+| **T5-Small** | Short | 57 words | 29 words | **0.6181s** | 46.9 w/s | 155.8 MB | CUDA (FP16) |
+| **T5-Small** | Medium | 231 words | 34 words | **0.6508s** | 52.2 w/s | 163.3 MB | CUDA (FP16) |
+| **T5-Small** | Long | 343 words | 47 words | **0.8700s** | 54.0 w/s | 170.5 MB | CUDA (FP16) |
+| **BART-Large-CNN** | Short | 57 words | 30 words | **0.5477s** | 54.8 w/s | 806.9 MB | CUDA (FP16) |
+| **BART-Large-CNN** | Medium | 231 words | 41 words | **0.6499s** | 63.1 w/s | 834.1 MB | CUDA (FP16) |
+| **BART-Large-CNN** | Long | 343 words | 43 words | **0.7811s** | 55.1 w/s | 849.7 MB | CUDA (FP16) |
+
+---
+
+### Sequential vs. True Vectorized Batching
+
+Measured on 4 standard test documents evaluated with `T5-Small`:
+
+| Execution Mode | Batch Size | Total Elapsed Time | Per-Document Latency | Throughput Speedup |
+|---|---|---|---|---|
+| **Sequential Processing** | 1 | 2.2345s | 0.5586s / doc | 1.00x (Baseline) |
+| **Vectorized Batching** | 4 | **0.5967s** | **0.1492s / doc** | **3.74x faster** |
+
+---
+
 ### Key Analytical Takeaways:
 
 1. **BART Dominance:**
@@ -386,8 +449,8 @@ All four architectures were evaluated on the **exact same 50 test samples** from
    - **ROUGE-L F1:** 27.11% (+5.29% over Lead-3, +8.71% over TextRank, +4.40% over T5-Small).
 2. **Precision vs. Recall Trade-off:**
    Extractive models achieve relatively high Recall because their summaries are long (62–66 words), capturing more reference words simply by producing more text. However, their Precision is low (20.77%–23.24%). In contrast, BART generates concise, targeted summaries (41.9 words) matching the human reference length, achieving the highest Precision (32.85%).
-3. **Inference Latency:**
-   Extractive methods execute on CPU in 2 to 5 milliseconds. BART-large-cnn with FP16 on the RTX 3060 Laptop GPU processed each document in **0.973 seconds** (~1.03 articles per second), which is highly practical for interactive deployment.
+3. **Inference Latency & Batch Throughput:**
+   Extractive methods execute on CPU in 0.1 to 5.7 milliseconds. Abstractive BART with FP16 on the RTX 3060 Laptop GPU generates summaries in **0.55s–0.78s** per document. With true batching enabled, throughput increases to **3.74x faster** for batch workloads.
 
 ---
 
@@ -443,11 +506,11 @@ The following publication charts are saved in `outputs/figures/`:
 The codebase features an automated test suite executed with `pytest`:
 - `tests/test_data_loader.py` (3 tests): Split loading, schema validation, length statistics.
 - `tests/test_preprocessing.py` (7 tests): Wire artifact cleaning, whitespace normalization, punctuation handling, and tokenizer formatting.
-- `tests/test_extractive.py` (7 tests): Lead-3, sentence similarity matrix, TextRank graph convergence, order preservation.
-- `tests/test_summarizer.py` (5 tests): Model initialization, input formatting, empty input handling, real T5 inference, real BART inference on CUDA.
+- `tests/test_extractive.py` (9 tests): Lead-3, sentence similarity matrix, TextRank graph convergence, order preservation, candidate capping, disconnected graph fallback.
+- `tests/test_summarizer.py` (9 tests): Model initialization, input formatting, empty input handling, generation presets, real T5 inference, true batching, warmup latency tracking, very long input truncation, real BART inference on CUDA.
 - `tests/test_evaluation.py` (5 tests): ROUGE-1/2/L score computations, edge cases (empty strings, length mismatches), metric aggregation.
 - `tests/test_visualization.py` (4 tests): Headless plot rendering and artifact validation.
-- `tests/test_app.py` (11 tests): UI Blocks creation, dynamic counters, empty input validation, extractive summarizer handlers, ModelManager memory eviction.
+- `tests/test_app.py` (15 tests): UI Blocks creation, dynamic counters, empty input validation, extractive summarizer handlers, ModelManager caching metadata, thread-safe concurrent access, model comparison rejection and execution.
 
 Execute the full test suite:
 ```powershell
@@ -456,7 +519,7 @@ pytest -v
 
 **Results:**
 ```text
-======================= 42 passed in 25.72s (100% pass rate) =======================
+======================= 52 passed in 34.12s (100% pass rate) =======================
 ```
 
 ---

@@ -1,0 +1,13 @@
+model,paradigm,document_length_category,input_words,output_words,init_time_sec,cold_latency_sec,warm_latency_mean_sec,warm_latency_min_sec,warm_latency_max_sec,throughput_words_per_sec,peak_vram_mb,device,throughput_tokens_per_sec
+Lead-3,Extractive Heuristic,short,48,48,0.0,0.0604,0.0002,0.0001,0.0002,269814.5,0.0,cpu,
+TextRank,Extractive Graph,short,48,48,0.0,0.0003,0.0001,0.0001,0.0002,325478.9,0.0,cpu,
+Lead-3,Extractive Heuristic,medium,157,79,0.0,0.0004,0.0004,0.0004,0.0005,188095.2,0.0,cpu,
+TextRank,Extractive Graph,medium,157,82,0.0,0.03,0.0041,0.0029,0.0048,19863.1,0.0,cpu,
+Lead-3,Extractive Heuristic,long,208,78,0.0,0.0004,0.0003,0.0003,0.0004,229935.9,0.0,cpu,
+TextRank,Extractive Graph,long,208,67,0.0,0.0076,0.0057,0.0046,0.0069,11679.2,0.0,cpu,
+T5-Small (quality),Abstractive Transformer,short,48,29,1.629,1.1893,0.6181,0.5034,0.7504,46.9,155.75,cuda:0,66.33
+T5-Small (quality),Abstractive Transformer,medium,157,34,1.629,0.5779,0.6508,0.6241,0.7018,52.2,163.29,cuda:0,75.29
+T5-Small (quality),Abstractive Transformer,long,208,47,1.629,0.8561,0.87,0.8221,0.9297,54.0,170.5,cuda:0,85.06
+BART-Large-CNN (quality),Abstractive Transformer,short,48,30,4.904,0.5637,0.5477,0.5374,0.5681,54.8,806.87,cuda:0,78.52
+BART-Large-CNN (quality),Abstractive Transformer,medium,157,41,4.904,0.6752,0.6499,0.6161,0.7,63.1,834.09,cuda:0,76.93
+BART-Large-CNN (quality),Abstractive Transformer,long,208,43,4.904,0.7595,0.7811,0.7472,0.8474,55.1,849.74,cuda:0,66.57
