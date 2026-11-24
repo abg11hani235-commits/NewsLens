@@ -206,14 +206,21 @@ To prevent concurrent GPU memory allocation or RAM spikes on cloud hosts:
 
 NewsLens is pre-configured for direct, zero-cost deployment to **Hugging Face Spaces** using the free CPU tier (2 vCPU, 16GB RAM).
 
-### Deployment Configuration
+### Deployment Configuration & Current Status
 - **SDK:** Gradio 6.32.0 (compatible with 5.x and 6.x)
 - **Entry Point:** `app.py`
 - **Dependency Split:**
   - `requirements.txt`: Clean, cross-platform dependencies without platform-specific wheel URLs.
-  - `requirements-cuda.txt`: Pinned Windows/CUDA 12.4 configuration for local development.
+  - `requirements-cuda.txt`: Pinned Windows/CUDA 12.4 configuration for local GPU development.
+- **Current Deployment Status:** Pre-configured and verified locally. The codebase is fully prepared for Hugging Face Spaces, but deployment is **not complete until a public Space URL is verified** by pushing to a configured Space remote (`space`). Currently, only the primary GitHub repository (`origin`) is connected.
 
-### Steps to Deploy on Hugging Face Spaces:
+> [!WARNING]
+> **Hardware Discrepancy & Performance Expectations:**
+> - **Local Development Hardware:** NVIDIA GeForce RTX 3060 Laptop GPU (6GB VRAM, CUDA 12.4, FP16 mixed precision).
+> - **Cloud Free Tier Hardware:** Hugging Face Spaces CPU Basic (2 vCPU, 16GB RAM, FP32 execution).
+> - Local sub-second inference latencies (~0.65s for BART) **do not represent Hugging Face CPU performance**. On 2 vCPUs without GPU acceleration, BART-Large-CNN requires approximately **5–8 seconds** per inference in FP32, while T5-Small takes **~1.5–2.5 seconds**. Extractive algorithms (Lead-3, TextRank) remain instantaneous (< 0.01s) on CPU.
+
+### Steps to Complete Hugging Face Spaces Deployment:
 1. Create a new Space on [Hugging Face](https://huggingface.co/new-space):
    - **Space Name:** `NewsLens`
    - **SDK:** Gradio
@@ -223,14 +230,7 @@ NewsLens is pre-configured for direct, zero-cost deployment to **Hugging Face Sp
    git remote add space https://huggingface.co/spaces/<your-username>/NewsLens
    git push space main
    ```
-3. Hugging Face Spaces will automatically read `app.py` and `requirements.txt`, install dependencies, and launch the application.
-
-> [!NOTE]
-> **Free CPU Tier Latency Expectations:**
-> - Extractive (Lead-3, TextRank): **< 0.01s** (instantaneous).
-> - T5-Small: **~1.5s** on 2 vCPUs.
-> - BART-Large-CNN: **~5–8s** on 2 vCPUs (vs. ~0.65s on CUDA GPU).
-> Model weights are downloaded automatically into cache on first inference and never committed to Git.
+3. Hugging Face Spaces will automatically read `app.py` and `requirements.txt`, install dependencies, and launch the application. Verify the live public URL upon completion.
 
 ---
 
@@ -412,22 +412,22 @@ All four architectures were evaluated on the **exact same 50 test samples** from
 
 ### Measured Performance & Throughput Benchmark
 
-Empirically measured using `scripts/benchmark_performance.py` across standardized Short (48 words), Medium (157 words), and Long (208 words) documents over 5 repetitions:
+Empirically measured using `scripts/benchmark_performance.py` across standardized Short (48 words), Medium (157 words), and Long (208 words) documents over 5 repetitions (NVIDIA GeForce RTX 3060 Laptop GPU, 6GB VRAM, CUDA 12.4, PyTorch 2.6.0, FP16):
 
 | Model Architecture | Document Scale | Input Words | Output Words | Warm Latency (Mean ± Std) | Warm Median | Output Throughput | Peak VRAM | Compute Device |
 |---|---|---|---|---|---|---|---|---|
-| **Lead-3** | Short | 48 words | 48 words | **0.0001s** (± 0.0s) | 0.0001s | ~498,900 w/s | 0.0 MB | CPU |
-| **Lead-3** | Medium | 157 words | 79 words | **0.0002s** (± 0.0s) | 0.0002s | ~353,000 w/s | 0.0 MB | CPU |
-| **Lead-3** | Long | 208 words | 78 words | **0.0003s** (± 0.0s) | 0.0003s | ~270,900 w/s | 0.0 MB | CPU |
-| **TextRank** | Short | 48 words | 48 words | **0.0001s** (± 0.0s) | 0.0001s | ~562,300 w/s | 0.0 MB | CPU |
-| **TextRank** | Medium | 157 words | 82 words | **0.0025s** (± 0.0002s) | 0.0025s | ~32,300 w/s | 0.0 MB | CPU |
-| **TextRank** | Long | 208 words | 67 words | **0.0038s** (± 0.0001s) | 0.0038s | ~17,500 w/s | 0.0 MB | CPU |
-| **T5-Small** | Short | 48 words | 29 words | **0.6282s** (± 0.0219s) | 0.6268s | 46.2 w/s | 155.8 MB | CUDA (FP16) |
-| **T5-Small** | Medium | 157 words | 34 words | **0.6765s** (± 0.0479s) | 0.6748s | 50.3 w/s | 163.3 MB | CUDA (FP16) |
-| **T5-Small** | Long | 208 words | 47 words | **1.0380s** (± 0.0373s) | 1.0473s | 45.3 w/s | 170.5 MB | CUDA (FP16) |
-| **BART-Large-CNN** | Short | 48 words | 30 words | **0.6359s** (± 0.0267s) | 0.6346s | 47.2 w/s | 806.9 MB | CUDA (FP16) |
-| **BART-Large-CNN** | Medium | 157 words | 41 words | **0.7891s** (± 0.0153s) | 0.7854s | 52.0 w/s | 834.1 MB | CUDA (FP16) |
-| **BART-Large-CNN** | Long | 208 words | 43 words | **0.8820s** (± 0.0198s) | 0.8770s | 48.8 w/s | 849.7 MB | CUDA (FP16) |
+| **Lead-3** | Short | 48 words | 48 words | **0.0001s** (± 0.0s) | 0.0001s | ~423,200 w/s | 0.0 MB | CPU |
+| **Lead-3** | Medium | 157 words | 79 words | **0.0002s** (± 0.0s) | 0.0002s | ~353,900 w/s | 0.0 MB | CPU |
+| **Lead-3** | Long | 208 words | 78 words | **0.0003s** (± 0.0s) | 0.0003s | ~260,300 w/s | 0.0 MB | CPU |
+| **TextRank** | Short | 48 words | 48 words | **0.0001s** (± 0.0s) | 0.0001s | ~513,200 w/s | 0.0 MB | CPU |
+| **TextRank** | Medium | 157 words | 82 words | **0.0026s** (± 0.0003s) | 0.0024s | ~31,700 w/s | 0.0 MB | CPU |
+| **TextRank** | Long | 208 words | 67 words | **0.0037s** (± 0.0001s) | 0.0037s | ~18,000 w/s | 0.0 MB | CPU |
+| **T5-Small** | Short | 48 words | 29 words | **0.5469s** (± 0.0278s) | 0.5504s | 53.0 w/s | 155.8 MB | CUDA (FP16) |
+| **T5-Small** | Medium | 157 words | 34 words | **0.7082s** (± 0.0563s) | 0.7179s | 48.0 w/s | 163.3 MB | CUDA (FP16) |
+| **T5-Small** | Long | 208 words | 47 words | **1.0822s** (± 0.0180s) | 1.0697s | 43.4 w/s | 170.5 MB | CUDA (FP16) |
+| **BART-Large-CNN** | Short | 48 words | 30 words | **0.6693s** (± 0.0304s) | 0.6680s | 44.8 w/s | 806.9 MB | CUDA (FP16) |
+| **BART-Large-CNN** | Medium | 157 words | 41 words | **0.8165s** (± 0.0294s) | 0.8162s | 50.2 w/s | 834.1 MB | CUDA (FP16) |
+| **BART-Large-CNN** | Long | 208 words | 43 words | **0.9203s** (± 0.0624s) | 0.9297s | 46.7 w/s | 849.7 MB | CUDA (FP16) |
 
 ---
 
@@ -437,12 +437,12 @@ The inference pipeline tracks fine-grained execution stages with microsecond pre
 
 | Model Architecture | Document Scale | Preprocessing | Tokenization | Neural Generation | Detokenization | Total End-to-End |
 |---|---|---|---|---|---|---|
-| **BART-Large-CNN** | Short (48 words) | < 0.1 ms | 0.5 ms | 635.0 ms (99.8%) | 0.1 ms | **636.0 ms** |
-| **BART-Large-CNN** | Medium (157 words) | < 0.1 ms | 0.7 ms | 788.0 ms (99.8%) | 0.1 ms | **789.0 ms** |
-| **BART-Large-CNN** | Long (208 words) | < 0.1 ms | 1.1 ms | 880.8 ms (99.8%) | 0.2 ms | **881.8 ms** |
-| **T5-Small** | Short (48 words) | < 0.1 ms | 0.5 ms | 627.4 ms (99.8%) | 0.1 ms | **628.2 ms** |
-| **T5-Small** | Medium (157 words) | < 0.1 ms | 0.8 ms | 675.2 ms (99.8%) | 0.1 ms | **676.6 ms** |
-| **T5-Small** | Long (208 words) | < 0.1 ms | 1.1 ms | 1,036.6 ms (99.8%) | 0.2 ms | **1,037.8 ms** |
+| **BART-Large-CNN** | Short (48 words) | < 0.1 ms | 0.4 ms | 668.4 ms (99.8%) | 0.1 ms | **669.4 ms** |
+| **BART-Large-CNN** | Medium (157 words) | < 0.1 ms | 0.8 ms | 815.0 ms (99.8%) | 0.2 ms | **816.4 ms** |
+| **BART-Large-CNN** | Long (208 words) | < 0.1 ms | 0.9 ms | 919.0 ms (99.8%) | 0.1 ms | **920.4 ms** |
+| **T5-Small** | Short (48 words) | < 0.1 ms | 0.5 ms | 546.2 ms (99.9%) | 0.1 ms | **546.8 ms** |
+| **T5-Small** | Medium (157 words) | < 0.1 ms | 0.9 ms | 706.6 ms (99.8%) | 0.1 ms | **708.0 ms** |
+| **T5-Small** | Long (208 words) | < 0.1 ms | 1.1 ms | 1,080.8 ms (99.8%) | 0.1 ms | **1,082.4 ms** |
 
 ---
 
@@ -452,8 +452,8 @@ Measured on 4 standard test documents evaluated with `T5-Small` on GPU:
 
 | Execution Mode | Batch Size | Total Elapsed Time | Per-Document Latency | Throughput Speedup |
 |---|---|---|---|---|
-| **Sequential Processing** | 1 | 2.8904s | 0.7226s / doc | 1.00x (Baseline) |
-| **Vectorized Batching** | 4 | **0.7143s** | **0.1786s / doc** | **4.05x faster** |
+| **Sequential Processing** | 1 | 2.9155s | 0.7289s / doc | 1.00x (Baseline) |
+| **Vectorized Batching** | 4 | **0.7274s** | **0.1819s / doc** | **4.01x faster** |
 
 ---
 
@@ -467,7 +467,7 @@ Measured on 4 standard test documents evaluated with `T5-Small` on GPU:
 2. **Precision vs. Recall Trade-off:**
    Extractive models achieve relatively high Recall because their summaries are long (62–66 words), capturing more reference words simply by producing more text. However, their Precision is low (20.77%–23.24%). In contrast, BART generates concise, targeted summaries (41.9 words) matching the human reference length, achieving the highest Precision (32.85%).
 3. **Inference Latency & Batch Throughput:**
-   Extractive methods execute on CPU in 0.1 to 3.8 milliseconds. Abstractive BART with FP16 on the RTX 3060 Laptop GPU generates summaries in **0.63s–0.88s** per document. With true batching enabled, throughput increases to **4.05x faster** for batch workloads.
+   Extractive methods execute on CPU in 0.1 to 3.7 milliseconds. Abstractive BART with FP16 on the RTX 3060 Laptop GPU generates summaries in **0.67s–0.92s** per document. With true batching enabled, throughput increases to **4.01x faster** for batch workloads.
 
 ---
 
@@ -520,14 +520,16 @@ The following publication charts are saved in `outputs/figures/`:
 
 ## Unit Testing & Quality Assurance
 
-The codebase features an automated test suite executed with `pytest`:
+The codebase features an automated test suite with 71 comprehensive tests executed with `pytest`:
 - `tests/test_data_loader.py` (3 tests): Split loading, schema validation, length statistics.
 - `tests/test_preprocessing.py` (7 tests): Wire artifact cleaning, whitespace normalization, punctuation handling, and tokenizer formatting.
 - `tests/test_extractive.py` (9 tests): Lead-3, sentence similarity matrix, TextRank graph convergence, order preservation, candidate capping, disconnected graph fallback.
-- `tests/test_summarizer.py` (9 tests): Model initialization, input formatting, empty input handling, generation presets, real T5 inference, true batching, warmup latency tracking, very long input truncation, real BART inference on CUDA.
+- `tests/test_textrank_stress.py` (6 tests): Graph convergence under extreme sentence counts (100, 500, 1000 sentences), identical sentences, whitespace-only, and ultra-long sentence inputs.
+- `tests/test_summarizer.py` (14 tests): Model initialization, input formatting, empty input handling, generation presets, real T5 inference, true batching, warmup latency tracking, very long input truncation, real BART inference on CUDA, granular metrics, FP16/CPU fallback, tensor memory release on OOM, and restoration verification.
 - `tests/test_evaluation.py` (5 tests): ROUGE-1/2/L score computations, edge cases (empty strings, length mismatches), metric aggregation.
 - `tests/test_visualization.py` (4 tests): Headless plot rendering and artifact validation.
-- `tests/test_app.py` (15 tests): UI Blocks creation, dynamic counters, empty input validation, extractive summarizer handlers, ModelManager caching metadata, thread-safe concurrent access, model comparison rejection and execution.
+- `tests/test_app.py` (16 tests): UI Blocks creation, dynamic counters, empty input validation, extractive summarizer handlers, ModelManager caching metadata, thread-safe concurrent access, model comparison rejection, and legacy retrieval blocking.
+- `tests/test_concurrency.py` (7 tests): Active lease eviction blocking, concurrent same-model leases, lease acquisition timeout, alternating multi-threaded requests, legacy retrieval timeout, concurrent single vs. batch inference synchronization, and batch OOM reentrant fallback.
 
 Execute the full test suite:
 ```powershell
@@ -536,7 +538,8 @@ pytest -v
 
 **Results:**
 ```text
-======================= 52 passed in 34.12s (100% pass rate) =======================
+======================= 71 passed in ~35s (100% pass rate) =======================
+```
 ```
 
 ---

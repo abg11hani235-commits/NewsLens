@@ -92,7 +92,7 @@ class AbstractiveSummarizer:
             f"Loading model '{self.model_name}' on {self.device} (FP16={self.use_fp16}, max_input={self.max_input_length})..."
         )
 
-        self._inference_lock = threading.Lock()
+        self._inference_lock = threading.RLock()
         init_start = time.perf_counter()
         self._load_model_and_tokenizer()
         self.init_time_sec = round(time.perf_counter() - init_start, 3)
@@ -238,10 +238,12 @@ class AbstractiveSummarizer:
                 logger.warning(
                     "CUDA Out-Of-Memory (OOM) encountered on GPU! Initiating safe FP32 CPU fallback..."
                 )
-                torch.cuda.empty_cache()
-
                 # Safely transfer all input tensors to CPU
                 cpu_inputs = {k: v.to("cpu") for k, v in inputs.items()}
+                # Release GPU inputs immediately so GPU VRAM is completely free for model restoration
+                del inputs
+                if self.is_cuda:
+                    torch.cuda.empty_cache()
 
                 try:
                     # Move model to CPU and convert weights to FP32 (CPU does not support FP16 ops)
@@ -253,9 +255,13 @@ class AbstractiveSummarizer:
                             **gen_params,
                         )
                 finally:
+                    # Clean up CPU input tensors
+                    if "cpu_inputs" in locals():
+                        del cpu_inputs
                     # Attempt to restore model back to original device and precision
-                    try:
+                    if original_device.type == "cuda":
                         torch.cuda.empty_cache()
+                    try:
                         self.model.to(original_device, dtype=original_dtype)
                         logger.info(
                             f"Model successfully restored back to {original_device} (dtype={original_dtype})."
@@ -293,7 +299,10 @@ class AbstractiveSummarizer:
                 self.warm_latencies.append(gen_latency_val)
 
             # Cleanup local tensors
-            del inputs, summary_ids
+            if "inputs" in locals():
+                del inputs
+            if "summary_ids" in locals():
+                del summary_ids
 
         # Determine truthful device status
         if used_cpu_fallback:
@@ -404,103 +413,115 @@ class AbstractiveSummarizer:
             if not valid_prepared_texts:
                 continue
 
-            try:
-                # Vectorized batch tokenization with dynamic padding
-                tok_start = time.perf_counter()
-                batch_inputs = self.tokenizer(
-                    valid_prepared_texts,
-                    max_length=self.max_input_length,
-                    padding=True,
-                    truncation=True,
-                    return_tensors="pt",
-                ).to(self.device)
-                tok_elapsed = time.perf_counter() - tok_start
+            with self._inference_lock:
+                try:
+                    # Vectorized batch tokenization with dynamic padding
+                    tok_start = time.perf_counter()
+                    batch_inputs = self.tokenizer(
+                        valid_prepared_texts,
+                        max_length=self.max_input_length,
+                        padding=True,
+                        truncation=True,
+                        return_tensors="pt",
+                    ).to(self.device)
+                    tok_elapsed = time.perf_counter() - tok_start
 
-                if self.is_cuda:
-                    torch.cuda.synchronize(self.device)
-                batch_start = time.perf_counter()
+                    if self.is_cuda:
+                        torch.cuda.synchronize(self.device)
+                    batch_start = time.perf_counter()
 
-                with torch.inference_mode():
-                    batch_summary_ids = self.model.generate(
-                        batch_inputs["input_ids"],
-                        attention_mask=batch_inputs.get("attention_mask"),
-                        **gen_params,
+                    with torch.inference_mode():
+                        batch_summary_ids = self.model.generate(
+                            batch_inputs["input_ids"],
+                            attention_mask=batch_inputs.get("attention_mask"),
+                            **gen_params,
+                        )
+
+                    if self.is_cuda:
+                        torch.cuda.synchronize(self.device)
+                    batch_elapsed = time.perf_counter() - batch_start
+                    per_item_latency = round(batch_elapsed / len(valid_prepared_texts), 3)
+
+                    # Batch decoding
+                    dec_start = time.perf_counter()
+                    batch_summaries = self.tokenizer.batch_decode(
+                        batch_summary_ids, skip_special_tokens=True
                     )
+                    dec_elapsed = time.perf_counter() - dec_start
+                    chunk_total_elapsed = time.perf_counter() - chunk_e2e_start
+                    per_item_e2e = round(chunk_total_elapsed / len(valid_prepared_texts), 3)
 
-                if self.is_cuda:
-                    torch.cuda.synchronize(self.device)
-                batch_elapsed = time.perf_counter() - batch_start
-                per_item_latency = round(batch_elapsed / len(valid_prepared_texts), 3)
+                    for k, sub_idx in enumerate(valid_sub_indices):
+                        global_idx = chunk_indices[sub_idx]
+                        if "attention_mask" in batch_inputs:
+                            in_toks = int(batch_inputs["attention_mask"][k].sum().item())
+                        else:
+                            in_toks = int(batch_inputs["input_ids"][k].shape[0])
+                        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else -100
+                        out_toks = int((batch_summary_ids[k] != pad_id).sum().item())
 
-                # Batch decoding
-                dec_start = time.perf_counter()
-                batch_summaries = self.tokenizer.batch_decode(
-                    batch_summary_ids, skip_special_tokens=True
-                )
-                dec_elapsed = time.perf_counter() - dec_start
-                chunk_total_elapsed = time.perf_counter() - chunk_e2e_start
-                per_item_e2e = round(chunk_total_elapsed / len(valid_prepared_texts), 3)
-
-                for k, sub_idx in enumerate(valid_sub_indices):
-                    global_idx = chunk_indices[sub_idx]
-                    if "attention_mask" in batch_inputs:
-                        in_toks = int(batch_inputs["attention_mask"][k].sum().item())
-                    else:
-                        in_toks = int(batch_inputs["input_ids"][k].shape[0])
-                    pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else -100
-                    out_toks = int((batch_summary_ids[k] != pad_id).sum().item())
-
-                    results[global_idx] = {
-                        "summary": batch_summaries[k].strip(),
-                        "latency_sec": per_item_latency,
-                        "generation_latency_sec": per_item_latency,
-                        "preprocessing_latency_sec": 0.0,
-                        "tokenization_latency_sec": round(tok_elapsed / len(valid_prepared_texts), 4),
-                        "decoding_latency_sec": round(dec_elapsed / len(valid_prepared_texts), 4),
-                        "total_e2e_latency_sec": per_item_e2e,
-                        "input_tokens": in_toks,
-                        "output_tokens": out_toks,
-                        "device": str(self.device),
-                        "init_time_sec": self.init_time_sec,
-                        "is_cold": False,
-                    }
-                    self.inference_count += 1
-                    self.warm_latencies.append(per_item_latency)
-
-                del batch_inputs, batch_summary_ids
-
-            except torch.cuda.OutOfMemoryError:
-                logger.warning(
-                    f"CUDA OOM during batch generation (size {len(valid_prepared_texts)}). "
-                    "Clearing GPU cache and falling back to sequential item processing..."
-                )
-                torch.cuda.empty_cache()
-                for sub_idx in valid_sub_indices:
-                    global_idx = chunk_indices[sub_idx]
-                    results[global_idx] = self.summarize_text(texts[global_idx], **override_kwargs)
-
-            except Exception as batch_err:
-                logger.error(
-                    f"Batch generation exception: {batch_err}. Falling back to single-text inference."
-                )
-                for sub_idx in valid_sub_indices:
-                    global_idx = chunk_indices[sub_idx]
-                    try:
-                        results[global_idx] = self.summarize_text(texts[global_idx], **override_kwargs)
-                    except Exception as single_err:
                         results[global_idx] = {
-                            "summary": f"[Error: {str(single_err)}]",
-                            "latency_sec": 0.0,
-                            "generation_latency_sec": 0.0,
+                            "summary": batch_summaries[k].strip(),
+                            "latency_sec": per_item_latency,
+                            "generation_latency_sec": per_item_latency,
                             "preprocessing_latency_sec": 0.0,
-                            "tokenization_latency_sec": 0.0,
-                            "decoding_latency_sec": 0.0,
-                            "total_e2e_latency_sec": 0.0,
-                            "input_tokens": 0,
-                            "output_tokens": 0,
+                            "tokenization_latency_sec": round(tok_elapsed / len(valid_prepared_texts), 4),
+                            "decoding_latency_sec": round(dec_elapsed / len(valid_prepared_texts), 4),
+                            "total_e2e_latency_sec": per_item_e2e,
+                            "input_tokens": in_toks,
+                            "output_tokens": out_toks,
                             "device": str(self.device),
-                            "error": str(single_err),
+                            "init_time_sec": self.init_time_sec,
+                            "is_cold": False,
                         }
+                        self.inference_count += 1
+                        self.warm_latencies.append(per_item_latency)
+
+                    del batch_inputs, batch_summary_ids
+
+                except torch.cuda.OutOfMemoryError:
+                    logger.warning(
+                        f"CUDA OOM during batch generation (size {len(valid_prepared_texts)}). "
+                        "Releasing GPU batch tensors and falling back to sequential item processing..."
+                    )
+                    if "batch_inputs" in locals():
+                        del batch_inputs
+                    if "batch_summary_ids" in locals():
+                        del batch_summary_ids
+                    if self.is_cuda:
+                        torch.cuda.empty_cache()
+                    for sub_idx in valid_sub_indices:
+                        global_idx = chunk_indices[sub_idx]
+                        results[global_idx] = self.summarize_text(texts[global_idx], **override_kwargs)
+
+                except Exception as batch_err:
+                    logger.error(
+                        f"Batch generation exception: {batch_err}. Falling back to single-text inference."
+                    )
+                    if "batch_inputs" in locals():
+                        del batch_inputs
+                    if "batch_summary_ids" in locals():
+                        del batch_summary_ids
+                    if self.is_cuda:
+                        torch.cuda.empty_cache()
+                    for sub_idx in valid_sub_indices:
+                        global_idx = chunk_indices[sub_idx]
+                        try:
+                            results[global_idx] = self.summarize_text(texts[global_idx], **override_kwargs)
+                        except Exception as single_err:
+                            results[global_idx] = {
+                                "summary": f"[Error: {str(single_err)}]",
+                                "latency_sec": 0.0,
+                                "generation_latency_sec": 0.0,
+                                "preprocessing_latency_sec": 0.0,
+                                "tokenization_latency_sec": 0.0,
+                                "decoding_latency_sec": 0.0,
+                                "total_e2e_latency_sec": 0.0,
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "device": str(self.device),
+                                "error": str(single_err),
+                            }
 
             done_count = sum(1 for r in results if r is not None)
             if done_count % 10 == 0 or done_count == total:

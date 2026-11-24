@@ -208,3 +208,32 @@ def test_cuda_oom_restore_failure_fallback_persistent():
         assert summarizer.device == torch.device("cpu")
         assert summarizer.is_cuda is False
 
+
+def test_cuda_oom_releases_gpu_inputs_before_restore():
+    """Verify that GPU inputs are released and empty_cache called before attempting model restore."""
+    summarizer = get_summarizer("t5")
+    call_count = 0
+    empty_cache_called_count = 0
+
+    real_generate = summarizer.model.generate
+    real_empty_cache = torch.cuda.empty_cache
+
+    def mock_generate(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory in test")
+        return real_generate(*args, **kwargs)
+
+    def mock_empty_cache():
+        nonlocal empty_cache_called_count
+        empty_cache_called_count += 1
+        return real_empty_cache()
+
+    with patch.object(summarizer.model, "generate", side_effect=mock_generate), \
+         patch("torch.cuda.empty_cache", side_effect=mock_empty_cache):
+        res = summarizer.summarize_text("Sample article to verify empty_cache calls during OOM.")
+        assert "summary" in res
+        assert empty_cache_called_count >= 1
+
+

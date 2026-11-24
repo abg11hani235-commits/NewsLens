@@ -167,13 +167,13 @@ def benchmark_abstractive_model(
     model_label: str,
     preset: str = "quality",
 ) -> List[Dict[str, Any]]:
-    """Benchmark abstractive model across document lengths."""
+    """Benchmark abstractive model across document lengths with rigorous memory and latency tracking."""
     results = []
     logger.info(f"Benchmarking Abstractive Model '{model_label}' (Preset={preset})...")
 
     if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
         torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
 
     init_start = time.perf_counter()
     summarizer = AbstractiveSummarizer(
@@ -182,17 +182,23 @@ def benchmark_abstractive_model(
     )
     init_time = round(time.perf_counter() - init_start, 3)
 
+    # Measure true model cold-start inference (first execution compiling GPU kernels and graph caches)
+    model_cold_start_sec = summarizer.warmup()
+
     for doc_len_name, text in DOCUMENTS.items():
         input_words = len(text.split())
 
-        # First run (Cold latency)
+        # Reset peak VRAM statistics before every independent document measurement
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+
+        # First inference for this specific document
+        doc_first_start = time.perf_counter()
+        first_res = summarizer.summarize_text(text, max_length=128, min_length=30)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        cold_start = time.perf_counter()
-        cold_res = summarizer.summarize_text(text, max_length=128, min_length=30)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        cold_lat = round(time.perf_counter() - cold_start, 4)
+        doc_first_latency = round(time.perf_counter() - doc_first_start, 4)
 
         # Warm runs (5 repetitions for high statistical fidelity)
         warm_latencies = []
@@ -226,7 +232,8 @@ def benchmark_abstractive_model(
         avg_tokens = float(np.mean(out_tokens_list))
         throughput_tok_sec = round(avg_tokens / max(avg_warm, 1e-6), 2)
         out_words = len(w_res["summary"].split())
-        input_tokens = cold_res.get("input_tokens", 0)
+        input_tokens = first_res.get("input_tokens", 0)
+        # Peak VRAM isolated specifically for this document
         peak_vram = get_max_vram_mb()
 
         results.append({
@@ -238,7 +245,8 @@ def benchmark_abstractive_model(
             "output_words": out_words,
             "output_tokens": int(round(avg_tokens)),
             "init_time_sec": init_time,
-            "cold_latency_sec": cold_lat,
+            "model_cold_start_sec": model_cold_start_sec,
+            "doc_first_inference_sec": doc_first_latency,
             "warm_latency_mean_sec": round(avg_warm, 4),
             "warm_latency_median_sec": round(med_warm, 4),
             "warm_latency_std_sec": round(std_warm, 4),
@@ -273,6 +281,7 @@ def benchmark_batch_vs_sequential() -> Dict[str, Any]:
 
     # 1. Sequential Inference (batch_size=1)
     if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
     seq_start = time.perf_counter()
     seq_results = []
@@ -284,6 +293,7 @@ def benchmark_batch_vs_sequential() -> Dict[str, Any]:
 
     # 2. Vectorized Batch Inference (batch_size=4)
     if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
     batch_start = time.perf_counter()
     batch_results = summarizer.summarize_batch(batch_texts, batch_size=4, max_length=64, min_length=15)

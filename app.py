@@ -200,26 +200,31 @@ class ModelManager:
         self,
         model_choice: str,
         warmup: bool = False,
+        timeout: float = 60.0,
     ) -> AbstractiveSummarizer:
-        """Retrieve the requested summarizer, ensuring thread safety and memory safety.
+        """Retrieve the requested summarizer safely without evicting actively leased models.
 
         Args:
             model_choice (str): 'bart' or 't5'.
             warmup (bool): Whether to perform model warmup if loaded from scratch.
+            timeout (float): Max seconds to wait if all cached models are actively leased.
 
         Returns:
             AbstractiveSummarizer: Ready-to-use summarizer instance.
         """
-        summarizer, _ = self.get_model_with_metadata(model_choice, warmup=warmup)
+        summarizer, _ = self.get_model_with_metadata(model_choice, warmup=warmup, timeout=timeout)
         return summarizer
 
     def get_model_with_metadata(
         self,
         model_choice: str,
         warmup: bool = False,
+        timeout: float = 60.0,
     ) -> Tuple[AbstractiveSummarizer, Dict[str, Any]]:
         """Retrieve model along with loading and cache metadata.
-        Respects active leases to prevent evicting in-use models.
+
+        Guarantees that no model currently serving an active lease is evicted.
+        If all cached models are actively leased, waits for an idle model to become available.
 
         Returns:
             Tuple[AbstractiveSummarizer, Dict[str, Any]]: (model, metadata_dict)
@@ -228,6 +233,7 @@ class ModelManager:
         if model_key not in ["bart", "t5"]:
             raise ValueError(f"Invalid model choice '{model_choice}'. Choose 'bart' or 't5'.")
 
+        start_wait = time.perf_counter()
         with self._lock:
             # Check if model is already in cache
             if model_key in self._cache:
@@ -243,17 +249,26 @@ class ModelManager:
                 self._last_loaded_metadata = meta
                 return summarizer, meta
 
-            # Evict least recently used model that is NOT actively leased
-            while len(self._cache) >= self.max_cached_models:
+            # Evict least recently used model that is NOT actively leased.
+            # If all cached models are actively leased, wait on condition variable.
+            while model_key not in self._cache and len(self._cache) >= self.max_cached_models:
                 evictable = [k for k in self._cache if self._active_leases.get(k, 0) == 0]
-                if not evictable:
-                    logger.warning("All models in cache are currently leased. Evicting oldest to satisfy non-leased request.")
-                    evict_k = next(iter(self._cache))
-                else:
+                if evictable:
                     evict_k = evictable[0]
-                evicted_model = self._cache.pop(evict_k)
-                logger.info(f"Evicting active model '{evict_k}' to free memory...")
-                evicted_model.unload_model()
+                    evicted_model = self._cache.pop(evict_k)
+                    logger.info(f"Evicting idle model '{evict_k}' to free memory for '{model_key}'...")
+                    evicted_model.unload_model()
+                    break
+                else:
+                    remaining = timeout - (time.perf_counter() - start_wait)
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"Timed out after {timeout}s waiting for active leases on {list(self._cache.keys())} to release before loading '{model_key}'."
+                        )
+                    logger.info(
+                        f"All cached models {list(self._cache.keys())} are actively leased. Waiting for lease release before loading '{model_key}'..."
+                    )
+                    self._cond.wait(timeout=min(remaining, 5.0))
 
             target_model_name = PRIMARY_MODEL_NAME if model_key == "bart" else ALTERNATIVE_MODEL_NAME
             logger.info(f"Loading '{target_model_name}' on demand...")

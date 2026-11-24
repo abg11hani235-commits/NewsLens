@@ -177,3 +177,112 @@ def test_simultaneous_requests_alternating_models():
             t.join(timeout=15.0)
 
         assert len(errors) == 0, f"Encountered concurrency errors: {errors}"
+
+
+# ==============================================================================
+# Priority 1 & 2 Regression Tests: Legacy Safety & Single vs Batch Concurrency
+# ==============================================================================
+
+def test_legacy_get_model_with_metadata_timeout():
+    """Verify legacy get_model_with_metadata cannot evict an actively leased model."""
+    mgr = ModelManager(max_cached_models=1)
+
+    with patch("app.AbstractiveSummarizer", side_effect=lambda model_name, **kw: MockSummarizer(model_name)):
+        lease_started = threading.Event()
+        lease_release = threading.Event()
+
+        def lease_holder():
+            with mgr.lease_model("bart"):
+                lease_started.set()
+                lease_release.wait(timeout=2.0)
+
+        t = threading.Thread(target=lease_holder)
+        t.start()
+        lease_started.wait(timeout=1.0)
+
+        # Legacy get_model_with_metadata must NOT evict bart; must raise TimeoutError if timeout expires
+        with pytest.raises(TimeoutError):
+            mgr.get_model_with_metadata("t5", timeout=0.1)
+
+        assert mgr.is_leased("bart")
+        lease_release.set()
+        t.join(timeout=2.0)
+        assert not mgr.is_leased("bart")
+
+
+def test_concurrent_single_vs_batch_inference_synchronization():
+    """Verify that concurrent single and batch inference synchronize safely on _inference_lock."""
+    from src.summarizer import AbstractiveSummarizer
+    # Test with real T5 model instance
+    summarizer = AbstractiveSummarizer(model_name="google-t5/t5-small")
+    assert isinstance(summarizer._inference_lock, type(threading.RLock()))
+
+    single_results = []
+    batch_results = []
+    errors = []
+
+    def single_worker():
+        try:
+            res = summarizer.summarize_text("First article about renewable energy and battery storage systems.")
+            single_results.append(res)
+        except Exception as e:
+            errors.append(f"Single worker error: {e}")
+
+    def batch_worker():
+        try:
+            res = summarizer.summarize_batch(
+                [
+                    "Second article on global semiconductor manufacturing facilities and fabrication plants.",
+                    "Third article analyzing space exploration initiatives and interstellar telescope designs.",
+                ],
+                batch_size=2,
+            )
+            batch_results.append(res)
+        except Exception as e:
+            errors.append(f"Batch worker error: {e}")
+
+    t1 = threading.Thread(target=single_worker)
+    t2 = threading.Thread(target=batch_worker)
+
+    t1.start()
+    t2.start()
+
+    t1.join(timeout=20.0)
+    t2.join(timeout=20.0)
+
+    assert len(errors) == 0, f"Encountered synchronization errors: {errors}"
+    assert len(single_results) == 1
+    assert len(single_results[0]["summary"]) > 0
+    assert len(batch_results) == 1
+    assert len(batch_results[0]) == 2
+    assert len(batch_results[0][0]["summary"]) > 0
+    assert len(batch_results[0][1]["summary"]) > 0
+
+
+def test_batch_inference_reentrancy_on_oom_fallback():
+    """Verify that CUDA OOM during batch inference does not deadlock when calling summarize_text."""
+    from src.summarizer import AbstractiveSummarizer
+    summarizer = AbstractiveSummarizer(model_name="google-t5/t5-small")
+
+    call_count = 0
+    real_generate = summarizer.model.generate
+
+    def mock_generate(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # Simulate OOM on first attempt (batch generation)
+            raise torch.cuda.OutOfMemoryError("CUDA OOM in batch test")
+        return real_generate(*args, **kwargs)
+
+    with patch.object(summarizer.model, "generate", side_effect=mock_generate):
+        # Should not deadlock; RLock allows summarize_batch to invoke summarize_text safely
+        articles = [
+            "Article A discussing environmental policy and forest conservation.",
+            "Article B analyzing macroeconomic inflation indicators and monetary policy.",
+        ]
+        results = summarizer.summarize_batch(articles, batch_size=2)
+        assert len(results) == 2
+        assert len(results[0]["summary"]) > 0
+        assert len(results[1]["summary"]) > 0
+

@@ -170,6 +170,39 @@ class TestModelManager:
 
         mgr.unload_all()
 
+    def test_legacy_get_model_blocks_while_other_model_leased(self):
+        """Verify legacy get_model does not evict an in-flight leased model."""
+        import time
+        import threading
+
+        mgr = ModelManager(max_cached_models=1)
+        lease_started = threading.Event()
+        release_lease = threading.Event()
+        legacy_unblocked = threading.Event()
+
+        def lease_worker():
+            with mgr.lease_model("t5"):
+                lease_started.set()
+                release_lease.wait(timeout=2.0)
+
+        def legacy_worker():
+            lease_started.wait(timeout=1.0)
+            # This legacy get_model call must NOT evict t5; it must wait until release_lease or timeout
+            with pytest.raises(TimeoutError):
+                mgr.get_model("bart", timeout=0.1)
+            legacy_unblocked.set()
+
+        t1 = threading.Thread(target=lease_worker)
+        t2 = threading.Thread(target=legacy_worker)
+        t1.start()
+        t2.start()
+
+        legacy_unblocked.wait(timeout=2.0)
+        release_lease.set()
+        t1.join(timeout=2.0)
+        t2.join(timeout=2.0)
+        mgr.unload_all()
+
 
 class TestCompareModels:
     """Tests for multi-model side-by-side comparison."""
