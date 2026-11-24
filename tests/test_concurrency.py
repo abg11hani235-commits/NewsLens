@@ -9,9 +9,11 @@ Verifies:
 """
 
 import time
+import logging
 import threading
 from unittest.mock import MagicMock, patch
 import pytest
+import torch
 
 from app import ModelManager
 
@@ -50,6 +52,12 @@ class MockSummarizer:
                 "device": "cpu",
                 "is_cold": False,
             }
+
+    def summarize_batch(self, texts, batch_size=1, **kwargs):
+        with self._inference_lock:
+            if self.is_unloaded:
+                raise RuntimeError(f"Attempted to run batch inference on unloaded model {self.model_name}!")
+            return [self.summarize_text(t, **kwargs) for t in texts]
 
     def unload_model(self):
         with self._inference_lock:
@@ -271,7 +279,7 @@ def test_concurrent_single_vs_batch_inference_synchronization():
     assert len(batch_results[0][1]["summary"]) > 0
 
 
-def test_batch_inference_reentrancy_on_oom_fallback():
+def test_batch_inference_reentrancy_on_oom_fallback(caplog):
     """Verify that CUDA OOM during batch inference does not deadlock when calling summarize_text."""
     from src.summarizer import AbstractiveSummarizer
     summarizer = AbstractiveSummarizer(model_name="google-t5/t5-small")
@@ -287,16 +295,21 @@ def test_batch_inference_reentrancy_on_oom_fallback():
             raise torch.cuda.OutOfMemoryError("CUDA OOM in batch test")
         return real_generate(*args, **kwargs)
 
-    with patch.object(summarizer.model, "generate", side_effect=mock_generate):
-        # Should not deadlock; RLock allows summarize_batch to invoke summarize_text safely
-        articles = [
-            "Article A discussing environmental policy and forest conservation.",
-            "Article B analyzing macroeconomic inflation indicators and monetary policy.",
-        ]
-        results = summarizer.summarize_batch(articles, batch_size=2)
-        assert len(results) == 2
-        assert len(results[0]["summary"]) > 0
-        assert len(results[1]["summary"]) > 0
+    with caplog.at_level(logging.WARNING):
+        with patch.object(summarizer.model, "generate", side_effect=mock_generate):
+            # Should not deadlock; RLock allows summarize_batch to invoke summarize_text safely
+            articles = [
+                "Article A discussing environmental policy and forest conservation.",
+                "Article B analyzing macroeconomic inflation indicators and monetary policy.",
+            ]
+            results = summarizer.summarize_batch(articles, batch_size=2)
+            assert len(results) == 2
+            assert len(results[0]["summary"]) > 0
+            assert len(results[1]["summary"]) > 0
+
+    assert call_count == 3
+    assert "CUDA OOM during batch generation" in caplog.text
+    assert "Batch generation exception" not in caplog.text
 
 
 def test_legacy_inference_blocks_model_eviction():
@@ -342,4 +355,243 @@ def test_legacy_inference_blocks_model_eviction():
         with mgr.lease_model("bart") as (bart_model, _):
             assert bart_model.model_name == "facebook/bart-large-cnn"
             assert t5_model.is_unloaded
+
+
+# ==============================================================================
+# Priority 4: Deterministic Lifecycle Regression Tests (Zero Arbitrary Sleeps)
+# ==============================================================================
+
+def test_eviction_blocked_during_preprocessing():
+    """Verify that an inference request paused during preprocessing blocks model eviction."""
+    mgr = ModelManager(max_cached_models=1)
+
+    prep_entered = threading.Event()
+    prep_can_finish = threading.Event()
+    inference_completed = threading.Event()
+    inference_errors = []
+
+    with patch("app.AbstractiveSummarizer", side_effect=lambda model_name, **kw: MockSummarizer(model_name)):
+        with mgr.lease_model("bart") as (bart_model, _):
+            pass
+
+        cached_bart = mgr._cache["bart"]
+        orig_summarize = cached_bart.summarize_text
+
+        def mock_summarize_text(text, **kwargs):
+            # Preprocessing happens inside _inference_lock
+            with cached_bart._inference_lock:
+                prep_entered.set()
+                prep_can_finish.wait(timeout=2.0)
+                return orig_summarize(text, **kwargs)
+
+        cached_bart.summarize_text = mock_summarize_text
+
+        def inference_worker():
+            try:
+                with mgr.lease_model("bart") as (model, _):
+                    model.summarize_text("Sample article text")
+            except Exception as e:
+                inference_errors.append(str(e))
+            finally:
+                inference_completed.set()
+
+        t_inf = threading.Thread(target=inference_worker)
+        t_inf.start()
+        prep_entered.wait(timeout=1.0)
+
+        # While BART is preprocessing under lease and lock, T5 attempt to evict must time out
+        with pytest.raises(TimeoutError):
+            with mgr.lease_model("t5", timeout=0.1):
+                pass
+
+        # Assert BART was not unloaded during preprocessing
+        assert not cached_bart.is_unloaded
+        assert mgr.is_leased("bart")
+
+        # Allow preprocessing to finish
+        prep_can_finish.set()
+        t_inf.join(timeout=2.0)
+        assert inference_completed.is_set()
+        assert len(inference_errors) == 0
+        assert not mgr.is_leased("bart")
+
+
+def test_inference_waiting_on_inference_lock_blocks_eviction():
+    """Verify that when a second inference request holds a lease and is waiting on _inference_lock, model cannot be evicted."""
+    mgr = ModelManager(max_cached_models=1)
+
+    with patch("app.AbstractiveSummarizer", side_effect=lambda model_name, **kw: MockSummarizer(model_name)):
+        with mgr.lease_model("bart") as (bart_model, _):
+            pass
+
+        cached_bart = mgr._cache["bart"]
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+        worker2_waiting = threading.Event()
+        worker2_done = threading.Event()
+
+        def lock_holder():
+            with cached_bart._inference_lock:
+                lock_held.set()
+                release_lock.wait(timeout=2.0)
+
+        def second_inference():
+            with mgr.lease_model("bart") as (model, _):
+                worker2_waiting.set()
+                # Blocks waiting for cached_bart._inference_lock
+                model.summarize_text("Second request")
+            worker2_done.set()
+
+        t1 = threading.Thread(target=lock_holder)
+        t1.start()
+        lock_held.wait(timeout=1.0)
+
+        t2 = threading.Thread(target=second_inference)
+        t2.start()
+        worker2_waiting.wait(timeout=1.0)
+
+        # Thread 2 holds a lease on bart while waiting on _inference_lock.
+        # Attempting to evict bart to load t5 must time out.
+        assert mgr.get_lease_count("bart") >= 1
+        with pytest.raises(TimeoutError):
+            with mgr.lease_model("t5", timeout=0.1):
+                pass
+
+        assert not cached_bart.is_unloaded
+
+        # Release first lock and wait for thread 2 to complete
+        release_lock.set()
+        t1.join(timeout=2.0)
+        t2.join(timeout=2.0)
+        assert worker2_done.is_set()
+
+
+def test_unload_model_waits_for_active_inference_to_complete():
+    """Verify that unload_model() blocks until an active inference request completes."""
+    from src.summarizer import AbstractiveSummarizer
+
+    summarizer = AbstractiveSummarizer(model_name="google-t5/t5-small")
+    inference_started = threading.Event()
+    allow_finish = threading.Event()
+    unload_started = threading.Event()
+    unload_finished = threading.Event()
+
+    orig_prepare = summarizer._prepare_input_text
+
+    def mock_prepare(text):
+        inference_started.set()
+        allow_finish.wait(timeout=2.0)
+        return orig_prepare(text)
+
+    summarizer._prepare_input_text = mock_prepare
+
+    def inference_worker():
+        summarizer.summarize_text("Article for testing unload synchronization.")
+
+    def unload_worker():
+        inference_started.wait(timeout=1.0)
+        unload_started.set()
+        summarizer.unload_model()
+        unload_finished.set()
+
+    t_inf = threading.Thread(target=inference_worker)
+    t_unload = threading.Thread(target=unload_worker)
+
+    t_inf.start()
+    t_unload.start()
+
+    unload_started.wait(timeout=1.0)
+    assert not unload_finished.is_set()
+    assert summarizer.model is not None
+    assert summarizer.tokenizer is not None
+
+    # Now allow inference to complete
+    allow_finish.set()
+    t_inf.join(timeout=5.0)
+    t_unload.join(timeout=5.0)
+
+    assert unload_finished.is_set()
+    assert summarizer.model is None
+    assert summarizer.tokenizer is None
+
+
+def test_legacy_retrieval_safe_proxy_prevents_use_after_unload():
+    """Verify that a SafeModelProxy acquired via legacy get_model() transparently re-leases after eviction."""
+    mgr = ModelManager(max_cached_models=1)
+
+    with patch("app.AbstractiveSummarizer", side_effect=lambda model_name, **kw: MockSummarizer(model_name)):
+        # 1. Retrieve legacy model reference
+        t5_proxy = mgr.get_model("t5")
+        first_instance = t5_proxy._last_instance
+        assert first_instance is not None
+        assert not first_instance.is_unloaded
+
+        # 2. Evict T5 by leasing BART
+        with mgr.lease_model("bart") as (bart_model, _):
+            assert "bart" in mgr._cache
+            assert "t5" not in mgr._cache
+            assert first_instance.is_unloaded
+
+        # 3. Caller uses the previously retrieved t5_proxy for inference.
+        # SafeModelProxy must safely re-lease and reload T5 without throwing use-after-unload error.
+        res = t5_proxy.summarize_text("Testing transparent re-leasing after eviction")
+        assert "t5" in res["summary"]
+        assert not t5_proxy._last_instance.is_unloaded
+
+
+def test_batch_preprocessing_and_oom_fallback_safety():
+    """Verify batch inference holds _inference_lock during preprocessing and sequential fallback."""
+    from src.summarizer import AbstractiveSummarizer
+
+    summarizer = AbstractiveSummarizer(model_name="google-t5/t5-small")
+    prep_lock_acquired = []
+
+    orig_prepare = summarizer._prepare_input_text
+
+    def mock_prepare(text):
+        # Verify that _inference_lock is already held during preprocessing
+        acquired = summarizer._inference_lock.acquire(blocking=False)
+        if not acquired:
+            prep_lock_acquired.append(False)
+        else:
+            # Reentrancy check: since it's an RLock, it should succeed if the current thread owns it
+            summarizer._inference_lock.release()
+            prep_lock_acquired.append(True)
+        return orig_prepare(text)
+
+    summarizer._prepare_input_text = mock_prepare
+
+    articles = [
+        "First article for batch safety verification.",
+        "Second article for batch safety verification.",
+    ]
+    results = summarizer.summarize_batch(articles, batch_size=2)
+    assert len(results) == 2
+    assert all(prep_lock_acquired)
+    assert len(prep_lock_acquired) == 2
+
+
+def test_no_leaked_leases_or_deadlocks_after_exception():
+    """Verify that exceptions during inference do not leak leases or cause deadlocks."""
+    mgr = ModelManager(max_cached_models=1)
+
+    with patch("app.AbstractiveSummarizer", side_effect=lambda model_name, **kw: MockSummarizer(model_name)):
+        # 1. Lease model and raise exception inside the lease context
+        with pytest.raises(RuntimeError, match="Simulated inference error"):
+            with mgr.lease_model("bart") as (model, _):
+                assert mgr.is_leased("bart")
+                raise RuntimeError("Simulated inference error")
+
+        # 2. Verify lease was cleaned up immediately
+        assert not mgr.is_leased("bart")
+        assert mgr.get_lease_count("bart") == 0
+
+        # 3. Subsequent lease operations on both models must succeed without deadlock or timeout
+        with mgr.lease_model("bart") as (bart_model, _):
+            assert bart_model.model_name == "facebook/bart-large-cnn"
+
+        with mgr.lease_model("t5") as (t5_model, _):
+            assert t5_model.model_name == "google-t5/t5-small"
+
+        assert not mgr.is_leased("t5")
 

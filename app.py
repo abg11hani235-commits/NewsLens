@@ -36,6 +36,7 @@ from config import (
     ALTERNATIVE_MODEL_NAME,
     BART_MAX_INPUT_LENGTH,
     T5_MAX_INPUT_LENGTH,
+    GENERATION_PARAMS,
     get_device,
 )
 from src.preprocessing import clean_text, ensure_nltk_resources, get_text_length_info
@@ -47,6 +48,128 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("newslens_app")
+
+# ==============================================================================
+# Lifecycle-Safe Model Proxy for Legacy Compatibility
+# ==============================================================================
+
+class SafeModelProxy(AbstractiveSummarizer):
+    """Lifecycle-safe proxy wrapper for legacy ModelManager model retrieval.
+
+    Protects callers using deprecated get_model() / get_model_with_metadata()
+    by routing all inference operations through ModelManager.lease_model().
+    This prevents concurrent eviction, use-after-unload conditions, or
+    accessing deallocated tokenizers during in-flight inference requests.
+    """
+
+    def __init__(self, manager: "ModelManager", model_key: str):
+        self._manager = manager
+        self._model_key = model_key
+        self.model_name = PRIMARY_MODEL_NAME if model_key == "bart" else ALTERNATIVE_MODEL_NAME
+        self.device = get_device()
+        self.is_cuda = (self.device.type == "cuda")
+        self.is_t5 = "t5" in self.model_name.lower()
+        self.max_input_length = T5_MAX_INPUT_LENGTH if self.is_t5 else BART_MAX_INPUT_LENGTH
+        self.generation_params = dict(GENERATION_PARAMS)
+        self._fallback_lock = threading.RLock()
+        self._last_instance: Optional[Any] = None
+        self.init_time_sec = 0.0
+
+    @property
+    def _inference_lock(self) -> threading.RLock:
+        with self._manager._lock:
+            cached = self._manager._cache.get(self._model_key)
+            if cached is not None and hasattr(cached, "_inference_lock"):
+                return cached._inference_lock
+            if self._last_instance is not None and hasattr(self._last_instance, "_inference_lock"):
+                return self._last_instance._inference_lock
+        return self._fallback_lock
+
+    @property
+    def is_unloaded(self) -> bool:
+        with self._manager._lock:
+            cached = self._manager._cache.get(self._model_key)
+            if cached is not None and hasattr(cached, "is_unloaded"):
+                return cached.is_unloaded
+            if self._last_instance is not None and hasattr(self._last_instance, "is_unloaded"):
+                return self._last_instance.is_unloaded
+        return True
+
+    @property
+    def is_inferring(self) -> bool:
+        with self._manager._lock:
+            cached = self._manager._cache.get(self._model_key)
+            if cached is not None and hasattr(cached, "is_inferring"):
+                return cached.is_inferring
+        return False
+
+    @property
+    def cold_latency_sec(self) -> Optional[float]:
+        with self._manager._lock:
+            cached = self._manager._cache.get(self._model_key)
+            return cached.cold_latency_sec if cached else None
+
+    @property
+    def warm_latencies(self) -> List[float]:
+        with self._manager._lock:
+            cached = self._manager._cache.get(self._model_key)
+            return cached.warm_latencies if cached else []
+
+    @property
+    def inference_count(self) -> int:
+        with self._manager._lock:
+            cached = self._manager._cache.get(self._model_key)
+            return cached.inference_count if cached else 0
+
+    @property
+    def model(self) -> Any:
+        with self._manager._lock:
+            cached = self._manager._cache.get(self._model_key)
+            if cached is not None and hasattr(cached, "model"):
+                return cached.model
+            if self._last_instance is not None and hasattr(self._last_instance, "model"):
+                return self._last_instance.model
+        return None
+
+    @property
+    def tokenizer(self) -> Any:
+        with self._manager._lock:
+            cached = self._manager._cache.get(self._model_key)
+            if cached is not None and hasattr(cached, "tokenizer"):
+                return cached.tokenizer
+            if self._last_instance is not None and hasattr(self._last_instance, "tokenizer"):
+                return self._last_instance.tokenizer
+        return None
+
+    def summarize_text(self, text: str, **kwargs) -> Dict[str, Any]:
+        with self._manager.lease_model(self._model_key) as (model, _):
+            self._last_instance = model
+            return model.summarize_text(text, **kwargs)
+
+    def summarize_batch(self, texts: List[str], **kwargs) -> List[Dict[str, Any]]:
+        with self._manager.lease_model(self._model_key) as (model, _):
+            self._last_instance = model
+            return model.summarize_batch(texts, **kwargs)
+
+    def warmup(self, sample_text: Optional[str] = None) -> float:
+        with self._manager.lease_model(self._model_key, warmup=False) as (model, _):
+            self._last_instance = model
+            return model.warmup(sample_text=sample_text)
+
+    def unload_model(self) -> None:
+        self._manager.unload_model(self._model_key)
+
+    def __getattr__(self, name: str) -> Any:
+        with self._manager._lock:
+            cached = self._manager._cache.get(self._model_key)
+            if cached is not None and hasattr(cached, name):
+                return getattr(cached, name)
+            if self._last_instance is not None and hasattr(self._last_instance, name):
+                return getattr(self._last_instance, name)
+        with self._manager.lease_model(self._model_key) as (model, _):
+            self._last_instance = model
+            return getattr(model, name)
+
 
 # ==============================================================================
 # Model Manager (Thread-Safe, Cached & Memory-Budgeted)
@@ -72,6 +195,7 @@ class ModelManager:
         self._cond = threading.Condition(self._lock)
         self._cache: "OrderedDict[str, AbstractiveSummarizer]" = OrderedDict()
         self._active_leases: Dict[str, int] = {}
+        self._proxies: Dict[str, SafeModelProxy] = {}
         self._last_loaded_metadata: Dict[str, Any] = {}
 
     @property
@@ -220,14 +344,12 @@ class ModelManager:
         warmup: bool = False,
         timeout: float = 60.0,
     ) -> AbstractiveSummarizer:
-        """Retrieve the requested summarizer instance (DEPRECATED).
+        """Retrieve a lifecycle-safe summarizer proxy (DEPRECATED).
 
         .. deprecated:: 2.1
             Use :meth:`lease_model` context manager instead. Direct model retrieval
-            does not hold an active lease; callers must ensure the model is protected
-            or wrapped in a lease to prevent concurrent eviction during inference.
-            Condition-variable waiting alone does NOT guarantee thread safety across
-            the full inference lifecycle if callers do not hold a lease.
+            returns a SafeModelProxy that routes inference calls through lease_model()
+            to protect against concurrent evictions and use-after-unload conditions.
 
         Args:
             model_choice (str): 'bart' or 't5'.
@@ -235,7 +357,7 @@ class ModelManager:
             timeout (float): Max seconds to wait if all cached models are in use.
 
         Returns:
-            AbstractiveSummarizer: Ready-to-use summarizer instance.
+            AbstractiveSummarizer: Lifecycle-safe summarizer instance.
         """
         warnings.warn(
             "ModelManager.get_model() is deprecated; callers should acquire a lease "
@@ -252,21 +374,15 @@ class ModelManager:
         warmup: bool = False,
         timeout: float = 60.0,
     ) -> Tuple[AbstractiveSummarizer, Dict[str, Any]]:
-        """Retrieve model along with loading and cache metadata (DEPRECATED).
+        """Retrieve a lifecycle-safe summarizer proxy along with metadata (DEPRECATED).
 
         .. deprecated:: 2.1
             Use :meth:`lease_model` context manager instead. Direct model retrieval
-            does not hold an active lease; callers must ensure the model is protected
-            or wrapped in a lease to prevent concurrent eviction during inference.
-            Condition-variable waiting alone does NOT guarantee thread safety across
-            the full inference lifecycle if callers do not hold a lease.
-
-        Guarantees that no model currently serving an active lease is evicted.
-        If all cached models are actively leased or executing inference, waits
-        for an idle model to become available.
+            returns a SafeModelProxy that routes inference calls through lease_model()
+            to protect against concurrent evictions and use-after-unload conditions.
 
         Returns:
-            Tuple[AbstractiveSummarizer, Dict[str, Any]]: (model, metadata_dict)
+            Tuple[AbstractiveSummarizer, Dict[str, Any]]: (proxy_model, metadata_dict)
         """
         warnings.warn(
             "ModelManager.get_model_with_metadata() is deprecated; callers should acquire a lease "
@@ -278,79 +394,59 @@ class ModelManager:
         if model_key not in ["bart", "t5"]:
             raise ValueError(f"Invalid model choice '{model_choice}'. Choose 'bart' or 't5'.")
 
-        start_wait = time.perf_counter()
         with self._lock:
-            # Check if model is already in cache
-            if model_key in self._cache:
-                summarizer = self._cache[model_key]
-                self._cache.move_to_end(model_key)
-                meta = {
-                    "model_key": model_key,
-                    "is_cached": True,
-                    "load_time_sec": 0.0,
-                    "init_time_sec": getattr(summarizer, "init_time_sec", 0.0),
-                    "is_warmed": summarizer.cold_latency_sec is not None,
-                }
-                self._last_loaded_metadata = meta
-                return summarizer, meta
+            if model_key not in self._proxies:
+                self._proxies[model_key] = SafeModelProxy(self, model_key)
+            proxy = self._proxies[model_key]
 
-            # Evict least recently used model that is NOT actively leased and NOT executing inference.
-            # If all cached models are in use, wait on condition variable.
-            while model_key not in self._cache and len(self._cache) >= self.max_cached_models:
-                evictable = [k for k, m in self._cache.items() if self._is_model_evictable(k, m)]
-                if evictable:
-                    evict_k = evictable[0]
-                    evicted_model = self._cache.pop(evict_k)
-                    logger.info(f"Evicting idle model '{evict_k}' to free memory for '{model_key}'...")
-                    evicted_model.unload_model()
-                    break
-                else:
-                    remaining = timeout - (time.perf_counter() - start_wait)
-                    if remaining <= 0:
-                        raise TimeoutError(
-                            f"Timed out after {timeout}s waiting for active leases or in-flight inference on {list(self._cache.keys())} to complete before loading '{model_key}'."
-                        )
-                    logger.info(
-                        f"All cached models {list(self._cache.keys())} are in use. Waiting for availability before loading '{model_key}'..."
-                    )
-                    self._cond.wait(timeout=min(remaining, 0.1))
+        with self.lease_model(model_key, warmup=warmup, timeout=timeout) as (real_model, meta):
+            proxy._last_instance = real_model
+            res_meta = dict(meta)
 
-            target_model_name = PRIMARY_MODEL_NAME if model_key == "bart" else ALTERNATIVE_MODEL_NAME
-            logger.info(f"Loading '{target_model_name}' on demand...")
+        return proxy, res_meta
 
-            load_start = time.perf_counter()
-            summarizer = AbstractiveSummarizer(
-                model_name=target_model_name,
-                device=get_device(),
-            )
-            load_elapsed = round(time.perf_counter() - load_start, 3)
+    def unload_model(self, model_choice: str, force: bool = False) -> bool:
+        """Unload a specific model if not actively leased or executing inference.
 
-            if warmup:
-                summarizer.warmup()
-
-            self._cache[model_key] = summarizer
-            meta = {
-                "model_key": model_key,
-                "is_cached": False,
-                "load_time_sec": load_elapsed,
-                "init_time_sec": summarizer.init_time_sec,
-                "is_warmed": summarizer.cold_latency_sec is not None,
-            }
-            self._last_loaded_metadata = meta
-            return summarizer, meta
+        Removes model from cache before invoking unload_model to prevent new leases,
+        and executes unload_model safely under the model's inference lock.
+        """
+        model_key = model_choice.lower().strip()
+        with self._lock:
+            if model_key not in self._cache:
+                return False
+            model = self._cache[model_key]
+            if not force and not self._is_model_evictable(model_key, model):
+                logger.warning(
+                    f"Model '{model_key}' has active leases ({self._active_leases.get(model_key, 0)}) "
+                    "or is currently inferencing. Cannot unload without force=True."
+                )
+                return False
+            del self._cache[model_key]
+            logger.info(f"Unloading model '{model_key}'...")
+            model.unload_model()
+            self._cond.notify_all()
+            return True
 
     def unload_all(self, force: bool = False) -> None:
         """Unload all active models completely and release resources."""
         with self._lock:
-            for key, model in list(self._cache.items()):
-                if not force and self._active_leases.get(key, 0) > 0:
-                    logger.warning(f"Model '{key}' has active leases ({self._active_leases[key]}). Skipping unload.")
+            for key in list(self._cache.keys()):
+                model = self._cache.get(key)
+                if model is None:
                     continue
+                if not force and not self._is_model_evictable(key, model):
+                    logger.warning(
+                        f"Model '{key}' has active leases ({self._active_leases.get(key, 0)}) "
+                        "or is currently inferencing. Skipping unload."
+                    )
+                    continue
+                del self._cache[key]
                 logger.info(f"Unloading model '{key}'...")
                 model.unload_model()
-                del self._cache[key]
             if not self._cache:
                 self._last_loaded_metadata = {}
+            self._cond.notify_all()
 
 
 # Global singleton instance

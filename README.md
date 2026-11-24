@@ -520,7 +520,7 @@ The following publication charts are saved in `outputs/figures/`:
 
 ## Unit Testing & Quality Assurance
 
-The codebase features an automated test suite with 73 comprehensive tests executed with `pytest`:
+The codebase features an automated test suite with 79 comprehensive tests executed with `pytest`:
 - `tests/test_data_loader.py` (3 tests): Split loading, schema validation, length statistics.
 - `tests/test_preprocessing.py` (7 tests): Wire artifact cleaning, whitespace normalization, punctuation handling, and tokenizer formatting.
 - `tests/test_extractive.py` (9 tests): Lead-3, sentence similarity matrix, TextRank graph convergence, order preservation, candidate capping, disconnected graph fallback.
@@ -529,7 +529,7 @@ The codebase features an automated test suite with 73 comprehensive tests execut
 - `tests/test_evaluation.py` (5 tests): ROUGE-1/2/L score computations, edge cases (empty strings, length mismatches), metric aggregation.
 - `tests/test_visualization.py` (4 tests): Headless plot rendering and artifact validation.
 - `tests/test_app.py` (16 tests): UI Blocks creation, dynamic counters, empty input validation, extractive summarizer handlers, ModelManager caching metadata, thread-safe concurrent access, model comparison rejection, and legacy retrieval blocking.
-- `tests/test_concurrency.py` (8 tests): Active lease eviction blocking, concurrent same-model leases, lease acquisition timeout, alternating multi-threaded requests, legacy retrieval timeout, concurrent single vs. batch inference synchronization, batch OOM reentrant fallback, and legacy inference eviction blocking.
+- `tests/test_concurrency.py` (14 tests): Active lease eviction blocking, concurrent same-model leases, lease acquisition timeout, alternating multi-threaded requests, legacy retrieval timeout, concurrent single vs. batch inference synchronization, verified CUDA OOM batch sequential fallback (asserting call counts and log branch entry), legacy inference eviction blocking, preprocessing eviction blocking, waiting-on-inference-lock eviction blocking, unload_model waiting for active inference, SafeModelProxy preventing use-after-unload, batch preprocessing and fallback safety, and exception safety without leaked leases.
 
 Execute the full test suite:
 ```powershell
@@ -538,7 +538,7 @@ pytest -v
 
 **Results:**
 ```text
-======================= 73 passed in ~54s (100% pass rate) =======================
+======================= 79 passed in ~63s (100% pass rate) =======================
 ```
 
 ---

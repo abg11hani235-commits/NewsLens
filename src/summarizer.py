@@ -192,17 +192,24 @@ class AbstractiveSummarizer:
                 "warm_latency_avg": 0.0,
             }
 
-        e2e_start = time.perf_counter()
-
-        # 1. Preprocessing stage
-        prep_start = time.perf_counter()
-        prepared_text = self._prepare_input_text(text)
-        prep_latency_sec = time.perf_counter() - prep_start
-
-        gen_params = dict(self.generation_params)
-        gen_params.update(override_kwargs)
-
         with self._inference_lock:
+            if getattr(self, "model", None) is None or getattr(self, "tokenizer", None) is None:
+                raise RuntimeError(
+                    f"Model '{self.model_name}' has been unloaded and cannot execute inference. "
+                    "Use 'with MODEL_MANAGER.lease_model(model_key) as (model, meta):' "
+                    "for safe model lifecycle management."
+                )
+
+            e2e_start = time.perf_counter()
+
+            # 1. Preprocessing stage
+            prep_start = time.perf_counter()
+            prepared_text = self._prepare_input_text(text)
+            prep_latency_sec = max(time.perf_counter() - prep_start, 1e-6)
+
+            gen_params = dict(self.generation_params)
+            gen_params.update(override_kwargs)
+
             # 2. Tokenization stage
             tok_start = time.perf_counter()
             inputs = self.tokenizer(
@@ -404,47 +411,54 @@ class AbstractiveSummarizer:
         total = len(texts)
         results: List[Optional[Dict[str, Any]]] = [None] * total
 
-        for chunk_start in range(0, total, batch_size):
-            chunk_indices = list(range(chunk_start, min(chunk_start + batch_size, total)))
-            valid_sub_indices = []
-            valid_prepared_texts = []
-            valid_prep_latencies = []
-            chunk_e2e_start = time.perf_counter()
+        with self._inference_lock:
+            if getattr(self, "model", None) is None or getattr(self, "tokenizer", None) is None:
+                raise RuntimeError(
+                    f"Model '{self.model_name}' has been unloaded and cannot execute batch inference. "
+                    "Use 'with MODEL_MANAGER.lease_model(model_key) as (model, meta):' "
+                    "for safe model lifecycle management."
+                )
 
-            for rel_idx, idx in enumerate(chunk_indices):
-                raw_text = texts[idx]
-                if raw_text and raw_text.strip():
-                    valid_sub_indices.append(rel_idx)
-                    t_prep_start = time.perf_counter()
-                    prep_text = self._prepare_input_text(raw_text)
-                    t_prep_elapsed = max(time.perf_counter() - t_prep_start, 1e-6)
-                    valid_prepared_texts.append(prep_text)
-                    valid_prep_latencies.append(t_prep_elapsed)
-                else:
-                    results[idx] = {
-                        "summary": "",
-                        "latency_sec": 0.0,
-                        "generation_latency_sec": 0.0,
-                        "preprocessing_latency_sec": 0.0,
-                        "tokenization_latency_sec": 0.0,
-                        "decoding_latency_sec": 0.0,
-                        "total_e2e_latency_sec": 0.0,
-                        "batch_tokenization_latency_sec": 0.0,
-                        "batch_generation_latency_sec": 0.0,
-                        "amortized_batch_latency_sec": 0.0,
-                        "chunk_elapsed_sec": 0.0,
-                        "is_amortized_batch": False,
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "device": str(self.device),
-                        "init_time_sec": self.init_time_sec,
-                        "is_cold": False,
-                    }
+            for chunk_start in range(0, total, batch_size):
+                chunk_indices = list(range(chunk_start, min(chunk_start + batch_size, total)))
+                valid_sub_indices = []
+                valid_prepared_texts = []
+                valid_prep_latencies = []
+                chunk_e2e_start = time.perf_counter()
 
-            if not valid_prepared_texts:
-                continue
+                for rel_idx, idx in enumerate(chunk_indices):
+                    raw_text = texts[idx]
+                    if raw_text and raw_text.strip():
+                        valid_sub_indices.append(rel_idx)
+                        t_prep_start = time.perf_counter()
+                        prep_text = self._prepare_input_text(raw_text)
+                        t_prep_elapsed = max(time.perf_counter() - t_prep_start, 1e-6)
+                        valid_prepared_texts.append(prep_text)
+                        valid_prep_latencies.append(t_prep_elapsed)
+                    else:
+                        results[idx] = {
+                            "summary": "",
+                            "latency_sec": 0.0,
+                            "generation_latency_sec": 0.0,
+                            "preprocessing_latency_sec": 0.0,
+                            "tokenization_latency_sec": 0.0,
+                            "decoding_latency_sec": 0.0,
+                            "total_e2e_latency_sec": 0.0,
+                            "batch_tokenization_latency_sec": 0.0,
+                            "batch_generation_latency_sec": 0.0,
+                            "amortized_batch_latency_sec": 0.0,
+                            "chunk_elapsed_sec": 0.0,
+                            "is_amortized_batch": False,
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "device": str(self.device),
+                            "init_time_sec": self.init_time_sec,
+                            "is_cold": False,
+                        }
 
-            with self._inference_lock:
+                if not valid_prepared_texts:
+                    continue
+
                 try:
                     # Vectorized batch tokenization with dynamic padding
                     tok_start = time.perf_counter()
