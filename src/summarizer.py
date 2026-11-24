@@ -331,25 +331,42 @@ class AbstractiveSummarizer:
             "warm_latency_avg": warm_avg,
         }
 
+    @property
+    def is_inferring(self) -> bool:
+        """Return True if an inference operation is actively running on this model.
+
+        Thread-safe check that attempts non-blocking acquisition of the inference lock.
+        """
+        if not hasattr(self, "_inference_lock"):
+            return False
+        acquired = self._inference_lock.acquire(blocking=False)
+        if acquired:
+            self._inference_lock.release()
+            return False
+        return True
+
     def unload_model(self) -> None:
         """Explicitly deallocate model and tokenizer from memory and clear GPU cache.
 
         Crucial for low-memory environments (such as 6GB VRAM or free cloud tiers)
-        to prevent memory exhaustion when switching between models.
+        to prevent memory exhaustion when switching between models. Synchronized
+        under inference lock to guarantee that in-flight generation completes before
+        weights or tokenizers are purged.
         """
-        logger.info(f"Unloading model '{self.model_name}' from memory...")
-        if hasattr(self, "model") and self.model is not None:
-            del self.model
-            self.model = None
+        with self._inference_lock:
+            logger.info(f"Unloading model '{self.model_name}' from memory...")
+            if hasattr(self, "model") and self.model is not None:
+                del self.model
+                self.model = None
 
-        if hasattr(self, "tokenizer") and self.tokenizer is not None:
-            del self.tokenizer
-            self.tokenizer = None
+            if hasattr(self, "tokenizer") and self.tokenizer is not None:
+                del self.tokenizer
+                self.tokenizer = None
 
-        gc.collect()
-        if self.is_cuda:
-            torch.cuda.empty_cache()
-        logger.info("Model unloaded and cache cleared successfully.")
+            gc.collect()
+            if self.is_cuda:
+                torch.cuda.empty_cache()
+            logger.info("Model unloaded and cache cleared successfully.")
 
     def summarize_batch(
         self,
@@ -360,6 +377,10 @@ class AbstractiveSummarizer:
         """Summarize a sequence of documents using true tokenized batch inference.
 
         Performs vectorized padding, truncation, batch generation, and batch decoding.
+        Measures individual per-document preprocessing independently while providing
+        granular shared batch timings (chunk elapsed time, batch tokenization, batch generation)
+        and explicitly distinguished amortized per-document batch latencies.
+
         If a CUDA OOM occurs during batch generation, it recovers gracefully by falling
         back item-by-item rather than failing the entire batch.
 
@@ -387,13 +408,18 @@ class AbstractiveSummarizer:
             chunk_indices = list(range(chunk_start, min(chunk_start + batch_size, total)))
             valid_sub_indices = []
             valid_prepared_texts = []
+            valid_prep_latencies = []
             chunk_e2e_start = time.perf_counter()
 
             for rel_idx, idx in enumerate(chunk_indices):
                 raw_text = texts[idx]
                 if raw_text and raw_text.strip():
                     valid_sub_indices.append(rel_idx)
-                    valid_prepared_texts.append(self._prepare_input_text(raw_text))
+                    t_prep_start = time.perf_counter()
+                    prep_text = self._prepare_input_text(raw_text)
+                    t_prep_elapsed = max(time.perf_counter() - t_prep_start, 1e-6)
+                    valid_prepared_texts.append(prep_text)
+                    valid_prep_latencies.append(t_prep_elapsed)
                 else:
                     results[idx] = {
                         "summary": "",
@@ -403,6 +429,11 @@ class AbstractiveSummarizer:
                         "tokenization_latency_sec": 0.0,
                         "decoding_latency_sec": 0.0,
                         "total_e2e_latency_sec": 0.0,
+                        "batch_tokenization_latency_sec": 0.0,
+                        "batch_generation_latency_sec": 0.0,
+                        "amortized_batch_latency_sec": 0.0,
+                        "chunk_elapsed_sec": 0.0,
+                        "is_amortized_batch": False,
                         "input_tokens": 0,
                         "output_tokens": 0,
                         "device": str(self.device),
@@ -440,7 +471,7 @@ class AbstractiveSummarizer:
                     if self.is_cuda:
                         torch.cuda.synchronize(self.device)
                     batch_elapsed = time.perf_counter() - batch_start
-                    per_item_latency = round(batch_elapsed / len(valid_prepared_texts), 3)
+                    per_item_latency = round(batch_elapsed / len(valid_prepared_texts), 4)
 
                     # Batch decoding
                     dec_start = time.perf_counter()
@@ -449,7 +480,7 @@ class AbstractiveSummarizer:
                     )
                     dec_elapsed = time.perf_counter() - dec_start
                     chunk_total_elapsed = time.perf_counter() - chunk_e2e_start
-                    per_item_e2e = round(chunk_total_elapsed / len(valid_prepared_texts), 3)
+                    per_item_e2e = round(chunk_total_elapsed / len(valid_prepared_texts), 4)
 
                     for k, sub_idx in enumerate(valid_sub_indices):
                         global_idx = chunk_indices[sub_idx]
@@ -464,10 +495,15 @@ class AbstractiveSummarizer:
                             "summary": batch_summaries[k].strip(),
                             "latency_sec": per_item_latency,
                             "generation_latency_sec": per_item_latency,
-                            "preprocessing_latency_sec": 0.0,
+                            "preprocessing_latency_sec": round(valid_prep_latencies[k], 6),
                             "tokenization_latency_sec": round(tok_elapsed / len(valid_prepared_texts), 4),
                             "decoding_latency_sec": round(dec_elapsed / len(valid_prepared_texts), 4),
                             "total_e2e_latency_sec": per_item_e2e,
+                            "batch_tokenization_latency_sec": round(tok_elapsed, 4),
+                            "batch_generation_latency_sec": round(batch_elapsed, 4),
+                            "amortized_batch_latency_sec": per_item_e2e,
+                            "chunk_elapsed_sec": round(chunk_total_elapsed, 4),
+                            "is_amortized_batch": True,
                             "input_tokens": in_toks,
                             "output_tokens": out_toks,
                             "device": str(self.device),
@@ -517,6 +553,11 @@ class AbstractiveSummarizer:
                                 "tokenization_latency_sec": 0.0,
                                 "decoding_latency_sec": 0.0,
                                 "total_e2e_latency_sec": 0.0,
+                                "batch_tokenization_latency_sec": 0.0,
+                                "batch_generation_latency_sec": 0.0,
+                                "amortized_batch_latency_sec": 0.0,
+                                "chunk_elapsed_sec": 0.0,
+                                "is_amortized_batch": False,
                                 "input_tokens": 0,
                                 "output_tokens": 0,
                                 "device": str(self.device),

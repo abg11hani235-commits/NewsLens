@@ -75,9 +75,36 @@ def test_summarize_batch_true_batching():
     batch_res = summarizer.summarize_batch(articles, batch_size=2, max_length=40, min_length=5)
     assert len(batch_res) == 3
     assert len(batch_res[0]["summary"]) > 0
+    assert batch_res[0]["preprocessing_latency_sec"] > 0.0
+    assert batch_res[0]["batch_tokenization_latency_sec"] > 0.0
+    assert batch_res[0]["batch_generation_latency_sec"] > 0.0
+    assert batch_res[0]["amortized_batch_latency_sec"] > 0.0
+    assert batch_res[0]["chunk_elapsed_sec"] > 0.0
+    assert batch_res[0]["is_amortized_batch"] is True
     assert batch_res[1]["summary"] == ""
     assert batch_res[1]["latency_sec"] == 0.0
+    assert batch_res[1]["preprocessing_latency_sec"] == 0.0
+    assert batch_res[1]["is_amortized_batch"] is False
     assert len(batch_res[2]["summary"]) > 0
+    assert batch_res[2]["preprocessing_latency_sec"] > 0.0
+
+
+def test_summarize_batch_granular_metrics():
+    """Verify that summarize_batch reports distinct per-document preprocessing and amortized batch metrics."""
+    summarizer = get_summarizer("t5")
+    texts = [
+        "Clean solar energy technology reduces carbon dioxide emissions across cities.",
+        "Artificial intelligence revolutionizes medical imaging diagnostic accuracy.",
+    ]
+    batch_res = summarizer.summarize_batch(texts, batch_size=2, max_length=30, min_length=5)
+    assert len(batch_res) == 2
+    for item in batch_res:
+        assert item["preprocessing_latency_sec"] > 0.0
+        assert item["batch_tokenization_latency_sec"] > 0.0
+        assert item["batch_generation_latency_sec"] > 0.0
+        assert item["amortized_batch_latency_sec"] > 0.0
+        assert item["chunk_elapsed_sec"] > 0.0
+        assert item["is_amortized_batch"] is True
 
 
 def test_summarize_warmup_and_latency_tracking():

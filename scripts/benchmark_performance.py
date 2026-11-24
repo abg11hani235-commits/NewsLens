@@ -182,8 +182,8 @@ def benchmark_abstractive_model(
     )
     init_time = round(time.perf_counter() - init_start, 3)
 
-    # Measure true model cold-start inference (first execution compiling GPU kernels and graph caches)
-    model_cold_start_sec = summarizer.warmup()
+    # Measure warmup inference latency (first execution compiling GPU kernels and graph caches)
+    warmup_inference_sec = summarizer.warmup()
 
     for doc_len_name, text in DOCUMENTS.items():
         input_words = len(text.split())
@@ -245,7 +245,7 @@ def benchmark_abstractive_model(
             "output_words": out_words,
             "output_tokens": int(round(avg_tokens)),
             "init_time_sec": init_time,
-            "model_cold_start_sec": model_cold_start_sec,
+            "warmup_inference_sec": warmup_inference_sec,
             "doc_first_inference_sec": doc_first_latency,
             "warm_latency_mean_sec": round(avg_warm, 4),
             "warm_latency_median_sec": round(med_warm, 4),

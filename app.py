@@ -15,6 +15,7 @@ import gc
 import time
 import inspect
 import logging
+import warnings
 import threading
 import contextlib
 from collections import OrderedDict
@@ -105,6 +106,23 @@ class ModelManager:
         with self._lock:
             return self._active_leases.get(model_choice.lower().strip(), 0)
 
+    def _is_model_evictable(self, key: str, model: Any) -> bool:
+        """Return True if model has no active leases AND is not currently executing inference.
+
+        Protects both actively leased models (via reference counting) and legacy-retrieved models
+        (via checking active inference locks or is_inferring flags).
+        """
+        if self._active_leases.get(key, 0) > 0:
+            return False
+        if hasattr(model, "is_inferring") and model.is_inferring:
+            return False
+        if hasattr(model, "_inference_lock"):
+            acquired = model._inference_lock.acquire(blocking=False)
+            if not acquired:
+                return False
+            model._inference_lock.release()
+        return True
+
     @contextlib.contextmanager
     def lease_model(
         self,
@@ -133,9 +151,9 @@ class ModelManager:
 
         start_wait = time.perf_counter()
         with self._lock:
-            # 1. If not cached and cache is at capacity, ensure an unleased model exists to evict
+            # 1. If not cached and cache is at capacity, ensure an unleased and idle model exists to evict
             while model_key not in self._cache and len(self._cache) >= self.max_cached_models:
-                evictable = [k for k in self._cache if self._active_leases.get(k, 0) == 0]
+                evictable = [k for k, m in self._cache.items() if self._is_model_evictable(k, m)]
                 if evictable:
                     evict_k = evictable[0]
                     evicted_model = self._cache.pop(evict_k)
@@ -146,12 +164,12 @@ class ModelManager:
                     remaining = timeout - (time.perf_counter() - start_wait)
                     if remaining <= 0:
                         raise TimeoutError(
-                            f"Timed out after {timeout}s waiting for active leases on {list(self._cache.keys())} to release before loading '{model_key}'."
+                            f"Timed out after {timeout}s waiting for active leases or in-flight inference on {list(self._cache.keys())} to complete before loading '{model_key}'."
                         )
                     logger.info(
-                        f"All cached models {list(self._cache.keys())} are actively leased. Waiting for lease release before loading '{model_key}'..."
+                        f"All cached models {list(self._cache.keys())} are in use. Waiting for availability before loading '{model_key}'..."
                     )
-                    self._cond.wait(timeout=min(remaining, 5.0))
+                    self._cond.wait(timeout=min(remaining, 0.1))
 
             # 2. Retrieve from cache or load on demand
             if model_key in self._cache:
@@ -202,16 +220,29 @@ class ModelManager:
         warmup: bool = False,
         timeout: float = 60.0,
     ) -> AbstractiveSummarizer:
-        """Retrieve the requested summarizer safely without evicting actively leased models.
+        """Retrieve the requested summarizer instance (DEPRECATED).
+
+        .. deprecated:: 2.1
+            Use :meth:`lease_model` context manager instead. Direct model retrieval
+            does not hold an active lease; callers must ensure the model is protected
+            or wrapped in a lease to prevent concurrent eviction during inference.
+            Condition-variable waiting alone does NOT guarantee thread safety across
+            the full inference lifecycle if callers do not hold a lease.
 
         Args:
             model_choice (str): 'bart' or 't5'.
             warmup (bool): Whether to perform model warmup if loaded from scratch.
-            timeout (float): Max seconds to wait if all cached models are actively leased.
+            timeout (float): Max seconds to wait if all cached models are in use.
 
         Returns:
             AbstractiveSummarizer: Ready-to-use summarizer instance.
         """
+        warnings.warn(
+            "ModelManager.get_model() is deprecated; callers should acquire a lease "
+            "using ModelManager.lease_model() context manager before running inference.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         summarizer, _ = self.get_model_with_metadata(model_choice, warmup=warmup, timeout=timeout)
         return summarizer
 
@@ -221,14 +252,28 @@ class ModelManager:
         warmup: bool = False,
         timeout: float = 60.0,
     ) -> Tuple[AbstractiveSummarizer, Dict[str, Any]]:
-        """Retrieve model along with loading and cache metadata.
+        """Retrieve model along with loading and cache metadata (DEPRECATED).
+
+        .. deprecated:: 2.1
+            Use :meth:`lease_model` context manager instead. Direct model retrieval
+            does not hold an active lease; callers must ensure the model is protected
+            or wrapped in a lease to prevent concurrent eviction during inference.
+            Condition-variable waiting alone does NOT guarantee thread safety across
+            the full inference lifecycle if callers do not hold a lease.
 
         Guarantees that no model currently serving an active lease is evicted.
-        If all cached models are actively leased, waits for an idle model to become available.
+        If all cached models are actively leased or executing inference, waits
+        for an idle model to become available.
 
         Returns:
             Tuple[AbstractiveSummarizer, Dict[str, Any]]: (model, metadata_dict)
         """
+        warnings.warn(
+            "ModelManager.get_model_with_metadata() is deprecated; callers should acquire a lease "
+            "using ModelManager.lease_model() context manager before running inference.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         model_key = model_choice.lower().strip()
         if model_key not in ["bart", "t5"]:
             raise ValueError(f"Invalid model choice '{model_choice}'. Choose 'bart' or 't5'.")
@@ -249,10 +294,10 @@ class ModelManager:
                 self._last_loaded_metadata = meta
                 return summarizer, meta
 
-            # Evict least recently used model that is NOT actively leased.
-            # If all cached models are actively leased, wait on condition variable.
+            # Evict least recently used model that is NOT actively leased and NOT executing inference.
+            # If all cached models are in use, wait on condition variable.
             while model_key not in self._cache and len(self._cache) >= self.max_cached_models:
-                evictable = [k for k in self._cache if self._active_leases.get(k, 0) == 0]
+                evictable = [k for k, m in self._cache.items() if self._is_model_evictable(k, m)]
                 if evictable:
                     evict_k = evictable[0]
                     evicted_model = self._cache.pop(evict_k)
@@ -263,12 +308,12 @@ class ModelManager:
                     remaining = timeout - (time.perf_counter() - start_wait)
                     if remaining <= 0:
                         raise TimeoutError(
-                            f"Timed out after {timeout}s waiting for active leases on {list(self._cache.keys())} to release before loading '{model_key}'."
+                            f"Timed out after {timeout}s waiting for active leases or in-flight inference on {list(self._cache.keys())} to complete before loading '{model_key}'."
                         )
                     logger.info(
-                        f"All cached models {list(self._cache.keys())} are actively leased. Waiting for lease release before loading '{model_key}'..."
+                        f"All cached models {list(self._cache.keys())} are in use. Waiting for availability before loading '{model_key}'..."
                     )
-                    self._cond.wait(timeout=min(remaining, 5.0))
+                    self._cond.wait(timeout=min(remaining, 0.1))
 
             target_model_name = PRIMARY_MODEL_NAME if model_key == "bart" else ALTERNATIVE_MODEL_NAME
             logger.info(f"Loading '{target_model_name}' on demand...")

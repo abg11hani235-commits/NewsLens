@@ -24,24 +24,36 @@ class MockSummarizer:
         self.init_time_sec = 0.05
         self.cold_latency_sec = 0.1
         self.is_unloaded = False
-        self._inference_lock = threading.Lock()
+        self._inference_lock = threading.RLock()
+
+    @property
+    def is_inferring(self) -> bool:
+        if not hasattr(self, "_inference_lock"):
+            return False
+        acquired = self._inference_lock.acquire(blocking=False)
+        if acquired:
+            self._inference_lock.release()
+            return False
+        return True
 
     def summarize_text(self, text: str, **kwargs):
-        if self.is_unloaded:
-            raise RuntimeError(f"Attempted to run inference on unloaded model {self.model_name}!")
-        time.sleep(0.05)  # Simulate forward pass
-        return {
-            "summary": f"Summary of {text} by {self.model_name}",
-            "latency_sec": 0.05,
-            "total_e2e_latency_sec": 0.06,
-            "input_tokens": 15,
-            "output_tokens": 10,
-            "device": "cpu",
-            "is_cold": False,
-        }
+        with self._inference_lock:
+            if self.is_unloaded:
+                raise RuntimeError(f"Attempted to run inference on unloaded model {self.model_name}!")
+            time.sleep(0.05)  # Simulate forward pass
+            return {
+                "summary": f"Summary of {text} by {self.model_name}",
+                "latency_sec": 0.05,
+                "total_e2e_latency_sec": 0.06,
+                "input_tokens": 15,
+                "output_tokens": 10,
+                "device": "cpu",
+                "is_cold": False,
+            }
 
     def unload_model(self):
-        self.is_unloaded = True
+        with self._inference_lock:
+            self.is_unloaded = True
 
 
 def test_model_manager_lease_blocks_eviction():
@@ -285,4 +297,49 @@ def test_batch_inference_reentrancy_on_oom_fallback():
         assert len(results) == 2
         assert len(results[0]["summary"]) > 0
         assert len(results[1]["summary"]) > 0
+
+
+def test_legacy_inference_blocks_model_eviction():
+    """Verify that a model retrieved via legacy get_model cannot be evicted while inference is running."""
+    mgr = ModelManager(max_cached_models=1)
+
+    with patch("app.AbstractiveSummarizer", side_effect=lambda model_name, **kw: MockSummarizer(model_name)):
+        # 1. Retrieve model using legacy direct retrieval (unleased)
+        t5_model = mgr.get_model("t5")
+        assert not mgr.is_leased("t5")  # No active lease was acquired
+
+        inference_running = threading.Event()
+        inference_should_finish = threading.Event()
+        inference_completed = threading.Event()
+
+        def legacy_inference_worker():
+            with t5_model._inference_lock:
+                inference_running.set()
+                # Hold the lock simulating in-flight inference
+                inference_should_finish.wait(timeout=2.0)
+            inference_completed.set()
+
+        t_inf = threading.Thread(target=legacy_inference_worker)
+        t_inf.start()
+        inference_running.wait(timeout=1.0)
+
+        # 2. While legacy inference is running, another request attempts to load 'bart'.
+        # Because max_cached_models=1 and 't5' is executing inference,
+        # 't5' must NOT be evicted. Attempting to acquire 'bart' with short timeout must time out.
+        with pytest.raises(TimeoutError):
+            with mgr.lease_model("bart", timeout=0.1):
+                pass
+
+        # Assert t5 was NOT unloaded while inference was running
+        assert not t5_model.is_unloaded
+
+        # 3. Allow legacy inference to complete
+        inference_should_finish.set()
+        t_inf.join(timeout=2.0)
+        assert inference_completed.is_set()
+
+        # 4. Now that inference finished and t5 is idle, loading bart succeeds and evicts idle t5
+        with mgr.lease_model("bart") as (bart_model, _):
+            assert bart_model.model_name == "facebook/bart-large-cnn"
+            assert t5_model.is_unloaded
 
