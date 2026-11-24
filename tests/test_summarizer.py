@@ -123,3 +123,88 @@ def test_summarize_real_bart():
 
     # Cleanly unload BART after test
     summarizer.unload_model()
+
+
+# ==============================================================================
+# Edge Cases & Robustness (Batch Validation, Granular Metrics, OOM Recovery)
+# ==============================================================================
+
+def test_summarize_batch_invalid_batch_size():
+    """Verify that batch_size < 1 raises ValueError."""
+    summarizer = get_summarizer("t5")
+    with pytest.raises(ValueError, match="batch_size must be at least 1"):
+        summarizer.summarize_batch(["Some text"], batch_size=0)
+    with pytest.raises(ValueError, match="batch_size must be at least 1"):
+        summarizer.summarize_batch(["Some text"], batch_size=-1)
+
+
+def test_summarize_granular_latency_metrics():
+    """Verify that summarize_text returns all granular stage latencies."""
+    summarizer = get_summarizer("t5")
+    res = summarizer.summarize_text("A simple test sentence to measure pipeline stages.")
+    assert "generation_latency_sec" in res
+    assert "preprocessing_latency_sec" in res
+    assert "tokenization_latency_sec" in res
+    assert "decoding_latency_sec" in res
+    assert "total_e2e_latency_sec" in res
+    assert res["total_e2e_latency_sec"] >= res["generation_latency_sec"]
+
+
+def test_cuda_oom_fp32_cpu_fallback_and_restore():
+    """Verify that when CUDA OOM occurs, the model moves to CPU in FP32 and restores to original device."""
+    summarizer = get_summarizer("t5")
+    call_count = 0
+    to_calls = []
+
+    real_generate = summarizer.model.generate
+    real_to = summarizer.model.to
+
+    def mock_generate(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory in test")
+        return real_generate(*args, **kwargs)
+
+    def mock_to(*args, **kwargs):
+        to_calls.append((args, kwargs))
+        return real_to(*args, **kwargs)
+
+    with patch.object(summarizer.model, "generate", side_effect=mock_generate), \
+         patch.object(summarizer.model, "to", side_effect=mock_to):
+        res = summarizer.summarize_text("Test article for CUDA OOM fallback handling.")
+        assert "summary" in res
+        assert len(res["summary"]) > 0
+        assert "oom-fallback-fp32" in res["device"]
+        cpu_calls = [c for c in to_calls if c[0] == ("cpu",) and c[1].get("dtype") == torch.float32]
+        assert len(cpu_calls) >= 1, "Expected model.to('cpu', dtype=torch.float32) call!"
+
+
+def test_cuda_oom_restore_failure_fallback_persistent():
+    """Verify that if restoration back to CUDA fails, model remains safely and persistently on CPU."""
+    summarizer = get_summarizer("t5")
+    call_count = 0
+
+    real_generate = summarizer.model.generate
+    real_to = summarizer.model.to
+
+    def mock_generate(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory in test")
+        return real_generate(*args, **kwargs)
+
+    def mock_to(device, *args, **kwargs):
+        if str(device) != "cpu":
+            raise RuntimeError("CUDA out of memory during GPU restoration attempt")
+        return real_to(device, *args, **kwargs)
+
+    with patch.object(summarizer.model, "generate", side_effect=mock_generate), \
+         patch.object(summarizer.model, "to", side_effect=mock_to):
+        res = summarizer.summarize_text("Test article for persistent CPU fallback.")
+        assert "summary" in res
+        assert "persistent" in res["device"]
+        assert summarizer.device == torch.device("cpu")
+        assert summarizer.is_cuda is False
+

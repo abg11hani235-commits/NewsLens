@@ -173,13 +173,14 @@ TextRank (Mihalcea & Tarau, 2004) is an unsupervised graph-based ranking model d
 ### 1. Consumer GPU Optimization (RTX 3060, 6GB VRAM)
 - **FP16 Mixed Precision:** Loaded via `torch.float16` when CUDA is available, reducing VRAM consumption by 50% (~780 MB–850 MB VRAM vs. ~3.2 GB in FP32).
 - **Explicit CUDA Synchronization:** Timing measurements use `torch.cuda.synchronize()` before and after generation to ensure accurate latency figures that reflect completed GPU execution kernels.
-- **Safe OOM Fallback with Device Restoration:** In `src/summarizer.py`, if a CUDA Out-Of-Memory exception occurs, all inputs (including attention masks) are transferred to CPU, inference completes on CPU, and the model is safely moved back or deallocated in a `try...finally` block.
+- **Safe FP32 CPU OOM Fallback with Precision Conversion:** In `src/summarizer.py`, if a CUDA Out-Of-Memory exception occurs, model weights are converted to `torch.float32` on CPU (since x86 CPUs do not support native Half-precision operations) and input tensors are moved to CPU. After CPU generation, restoration to GPU is attempted; if restoration fails, the instance cleanly switches to persistent CPU execution with truthful telemetry (`cpu (oom-fallback-fp32, persistent)`).
 - **Elimination of Hot-Path Cache Thrashing:** Removed unnecessary `torch.cuda.empty_cache()` calls from the normal generation path. PyTorch's caching allocator reuses tensor memory at native speed without driver-level CPU-GPU synchronization stalls.
 
-### 2. Thread-Safe Model Management (`ModelManager`)
+### 2. Thread-Safe Model Management & Lease Lifecycle (`ModelManager`)
 To prevent concurrent GPU memory allocation or RAM spikes on cloud hosts:
 - Singleton `ModelManager` class lazily loads models on demand.
-- Implements thread-safe locking using `threading.RLock()` to prevent race conditions during model loading, inference, and eviction.
+- **Inference Lifecycle Leasing (`lease_model`):** Protects active inference sessions using reference counting and a `threading.Condition` variable. A model actively serving a request is guaranteed never to be evicted or unloaded mid-generation by a concurrent request.
+- **Fair Eviction Wait Queue:** If all cached models are actively leased, new requests wait on condition variable notification rather than corrupting in-flight generation.
 - Tracks model loading and initialization time separately from active inference time.
 - Implements cold-start vs. warm-start latency profiling.
 - Supports proactive model warmup (`warmup()`) to page weights into GPU memory and compile execution graphs before user requests.
@@ -191,12 +192,13 @@ To prevent concurrent GPU memory allocation or RAM spikes on cloud hosts:
 
 | Optimization | Target Module | Technical Implementation | Measured Impact |
 |---|---|---|---|
-| **True Vectorized Batching** | `src/summarizer.py` | Vectorized batch tokenization with dynamic padding and batch decoding. | **3.74x throughput speedup** over sequential execution. |
+| **True Vectorized Batching** | `src/summarizer.py` | Vectorized batch tokenization with dynamic padding and batch decoding. | **4.05x throughput speedup** over sequential execution. |
 | **Hot-Path Cache Retention** | `src/summarizer.py` | Removed `empty_cache()` from single inference; reserve only for OOM recovery and eviction. | Prevents driver-level stalls; enables sub-second warm inference. |
+| **FP32 CPU OOM Fallback** | `src/summarizer.py` | Recovers from GPU OOM by casting weights to FP32 on CPU, executing safely, then restoring. | Prevents `Half` precision crashes on standard x86 CPU architectures. |
 | **Vectorized TextRank Graph** | `src/extractive.py` | Constructed NetworkX graph directly from thresholded NumPy adjacency matrix. | Eliminates Python double loop; scales to large matrices instantly. |
-| **Candidate Sentence Capping** | `src/extractive.py` | Capped TextRank candidate pool to leading 50 sentences (`max_candidate_sentences=50`). | Guaranteed `< 6ms` latency even on documents with 1,000+ sentences. |
+| **Candidate Sentence Capping** | `src/extractive.py` | Capped TextRank candidate pool to leading 50 sentences (`max_candidate_sentences=50`). | Guaranteed `< 4ms` latency even on documents with 1,000+ sentences. |
 | **Lazy Module Ingestion** | `main.py`, `src/preprocessing.py` | Deferred heavy imports (transformers, matplotlib, seaborn, evaluate) to subcommands. | Reduced CLI startup latency from **>7.0s to 2.0s**. |
-| **Thread-Safe Model Manager** | `app.py` | Protected singleton model retrieval and eviction with reentrant lock (`threading.RLock`). | Completely prevents race conditions and corrupted states under concurrent requests. |
+| **Lifecycle Leasing Concurrency** | `app.py` | Reference counting + Condition variable leasing (`lease_model`) prevents mid-inference evictions. | Zero race conditions under simultaneous multi-user requests switching BART/T5. |
 
 ---
 
@@ -410,33 +412,48 @@ All four architectures were evaluated on the **exact same 50 test samples** from
 
 ### Measured Performance & Throughput Benchmark
 
-Empirically measured using `scripts/benchmark_performance.py` across Short (~60 words), Medium (~230 words), and Long (~340 words) articles:
+Empirically measured using `scripts/benchmark_performance.py` across standardized Short (48 words), Medium (157 words), and Long (208 words) documents over 5 repetitions:
 
-| Model Architecture | Document Scale | Input Words | Output Words | Warm Latency (Mean) | Output Throughput | Peak VRAM | Compute Device |
-|---|---|---|---|---|---|---|---|
-| **Lead-3** | Short | 57 words | 57 words | **0.0002s** | ~269,000 w/s | 0.0 MB | CPU |
-| **Lead-3** | Medium | 231 words | 75 words | **0.0004s** | ~188,000 w/s | 0.0 MB | CPU |
-| **Lead-3** | Long | 343 words | 69 words | **0.0003s** | ~230,000 w/s | 0.0 MB | CPU |
-| **TextRank** | Short | 57 words | 57 words | **0.0001s** | ~325,000 w/s | 0.0 MB | CPU |
-| **TextRank** | Medium | 231 words | 82 words | **0.0041s** | ~19,800 w/s | 0.0 MB | CPU |
-| **TextRank** | Long | 343 words | 67 words | **0.0057s** | ~11,600 w/s | 0.0 MB | CPU |
-| **T5-Small** | Short | 57 words | 29 words | **0.6181s** | 46.9 w/s | 155.8 MB | CUDA (FP16) |
-| **T5-Small** | Medium | 231 words | 34 words | **0.6508s** | 52.2 w/s | 163.3 MB | CUDA (FP16) |
-| **T5-Small** | Long | 343 words | 47 words | **0.8700s** | 54.0 w/s | 170.5 MB | CUDA (FP16) |
-| **BART-Large-CNN** | Short | 57 words | 30 words | **0.5477s** | 54.8 w/s | 806.9 MB | CUDA (FP16) |
-| **BART-Large-CNN** | Medium | 231 words | 41 words | **0.6499s** | 63.1 w/s | 834.1 MB | CUDA (FP16) |
-| **BART-Large-CNN** | Long | 343 words | 43 words | **0.7811s** | 55.1 w/s | 849.7 MB | CUDA (FP16) |
+| Model Architecture | Document Scale | Input Words | Output Words | Warm Latency (Mean ± Std) | Warm Median | Output Throughput | Peak VRAM | Compute Device |
+|---|---|---|---|---|---|---|---|---|
+| **Lead-3** | Short | 48 words | 48 words | **0.0001s** (± 0.0s) | 0.0001s | ~498,900 w/s | 0.0 MB | CPU |
+| **Lead-3** | Medium | 157 words | 79 words | **0.0002s** (± 0.0s) | 0.0002s | ~353,000 w/s | 0.0 MB | CPU |
+| **Lead-3** | Long | 208 words | 78 words | **0.0003s** (± 0.0s) | 0.0003s | ~270,900 w/s | 0.0 MB | CPU |
+| **TextRank** | Short | 48 words | 48 words | **0.0001s** (± 0.0s) | 0.0001s | ~562,300 w/s | 0.0 MB | CPU |
+| **TextRank** | Medium | 157 words | 82 words | **0.0025s** (± 0.0002s) | 0.0025s | ~32,300 w/s | 0.0 MB | CPU |
+| **TextRank** | Long | 208 words | 67 words | **0.0038s** (± 0.0001s) | 0.0038s | ~17,500 w/s | 0.0 MB | CPU |
+| **T5-Small** | Short | 48 words | 29 words | **0.6282s** (± 0.0219s) | 0.6268s | 46.2 w/s | 155.8 MB | CUDA (FP16) |
+| **T5-Small** | Medium | 157 words | 34 words | **0.6765s** (± 0.0479s) | 0.6748s | 50.3 w/s | 163.3 MB | CUDA (FP16) |
+| **T5-Small** | Long | 208 words | 47 words | **1.0380s** (± 0.0373s) | 1.0473s | 45.3 w/s | 170.5 MB | CUDA (FP16) |
+| **BART-Large-CNN** | Short | 48 words | 30 words | **0.6359s** (± 0.0267s) | 0.6346s | 47.2 w/s | 806.9 MB | CUDA (FP16) |
+| **BART-Large-CNN** | Medium | 157 words | 41 words | **0.7891s** (± 0.0153s) | 0.7854s | 52.0 w/s | 834.1 MB | CUDA (FP16) |
+| **BART-Large-CNN** | Long | 208 words | 43 words | **0.8820s** (± 0.0198s) | 0.8770s | 48.8 w/s | 849.7 MB | CUDA (FP16) |
+
+---
+
+### Granular Pipeline Stage Latency Breakdown
+
+The inference pipeline tracks fine-grained execution stages with microsecond precision:
+
+| Model Architecture | Document Scale | Preprocessing | Tokenization | Neural Generation | Detokenization | Total End-to-End |
+|---|---|---|---|---|---|---|
+| **BART-Large-CNN** | Short (48 words) | < 0.1 ms | 0.5 ms | 635.0 ms (99.8%) | 0.1 ms | **636.0 ms** |
+| **BART-Large-CNN** | Medium (157 words) | < 0.1 ms | 0.7 ms | 788.0 ms (99.8%) | 0.1 ms | **789.0 ms** |
+| **BART-Large-CNN** | Long (208 words) | < 0.1 ms | 1.1 ms | 880.8 ms (99.8%) | 0.2 ms | **881.8 ms** |
+| **T5-Small** | Short (48 words) | < 0.1 ms | 0.5 ms | 627.4 ms (99.8%) | 0.1 ms | **628.2 ms** |
+| **T5-Small** | Medium (157 words) | < 0.1 ms | 0.8 ms | 675.2 ms (99.8%) | 0.1 ms | **676.6 ms** |
+| **T5-Small** | Long (208 words) | < 0.1 ms | 1.1 ms | 1,036.6 ms (99.8%) | 0.2 ms | **1,037.8 ms** |
 
 ---
 
 ### Sequential vs. True Vectorized Batching
 
-Measured on 4 standard test documents evaluated with `T5-Small`:
+Measured on 4 standard test documents evaluated with `T5-Small` on GPU:
 
 | Execution Mode | Batch Size | Total Elapsed Time | Per-Document Latency | Throughput Speedup |
 |---|---|---|---|---|
-| **Sequential Processing** | 1 | 2.2345s | 0.5586s / doc | 1.00x (Baseline) |
-| **Vectorized Batching** | 4 | **0.5967s** | **0.1492s / doc** | **3.74x faster** |
+| **Sequential Processing** | 1 | 2.8904s | 0.7226s / doc | 1.00x (Baseline) |
+| **Vectorized Batching** | 4 | **0.7143s** | **0.1786s / doc** | **4.05x faster** |
 
 ---
 
@@ -450,7 +467,7 @@ Measured on 4 standard test documents evaluated with `T5-Small`:
 2. **Precision vs. Recall Trade-off:**
    Extractive models achieve relatively high Recall because their summaries are long (62–66 words), capturing more reference words simply by producing more text. However, their Precision is low (20.77%–23.24%). In contrast, BART generates concise, targeted summaries (41.9 words) matching the human reference length, achieving the highest Precision (32.85%).
 3. **Inference Latency & Batch Throughput:**
-   Extractive methods execute on CPU in 0.1 to 5.7 milliseconds. Abstractive BART with FP16 on the RTX 3060 Laptop GPU generates summaries in **0.55s–0.78s** per document. With true batching enabled, throughput increases to **3.74x faster** for batch workloads.
+   Extractive methods execute on CPU in 0.1 to 3.8 milliseconds. Abstractive BART with FP16 on the RTX 3060 Laptop GPU generates summaries in **0.63s–0.88s** per document. With true batching enabled, throughput increases to **4.05x faster** for batch workloads.
 
 ---
 

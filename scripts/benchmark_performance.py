@@ -113,6 +113,7 @@ def benchmark_extractive_methods() -> List[Dict[str, Any]]:
             latencies.append(time.perf_counter() - t0)
 
         out_words = len(summary.split())
+        warm_lats = latencies[1:]
         results.append({
             "model": "Lead-3",
             "paradigm": "Extractive Heuristic",
@@ -121,10 +122,12 @@ def benchmark_extractive_methods() -> List[Dict[str, Any]]:
             "output_words": out_words,
             "init_time_sec": 0.0,
             "cold_latency_sec": round(latencies[0], 4),
-            "warm_latency_mean_sec": round(float(np.mean(latencies[1:])), 4),
-            "warm_latency_min_sec": round(float(np.min(latencies[1:])), 4),
-            "warm_latency_max_sec": round(float(np.max(latencies[1:])), 4),
-            "throughput_words_per_sec": round(out_words / max(float(np.mean(latencies[1:])), 1e-6), 1),
+            "warm_latency_mean_sec": round(float(np.mean(warm_lats)), 4),
+            "warm_latency_median_sec": round(float(np.median(warm_lats)), 4),
+            "warm_latency_std_sec": round(float(np.std(warm_lats)), 4),
+            "warm_latency_min_sec": round(float(np.min(warm_lats)), 4),
+            "warm_latency_max_sec": round(float(np.max(warm_lats)), 4),
+            "throughput_words_per_sec": round(out_words / max(float(np.mean(warm_lats)), 1e-6), 1),
             "peak_vram_mb": 0.0,
             "device": "cpu",
         })
@@ -137,6 +140,7 @@ def benchmark_extractive_methods() -> List[Dict[str, Any]]:
             latencies.append(time.perf_counter() - t0)
 
         out_words = len(summary.split())
+        warm_lats = latencies[1:]
         results.append({
             "model": "TextRank",
             "paradigm": "Extractive Graph",
@@ -145,10 +149,12 @@ def benchmark_extractive_methods() -> List[Dict[str, Any]]:
             "output_words": out_words,
             "init_time_sec": 0.0,
             "cold_latency_sec": round(latencies[0], 4),
-            "warm_latency_mean_sec": round(float(np.mean(latencies[1:])), 4),
-            "warm_latency_min_sec": round(float(np.min(latencies[1:])), 4),
-            "warm_latency_max_sec": round(float(np.max(latencies[1:])), 4),
-            "throughput_words_per_sec": round(out_words / max(float(np.mean(latencies[1:])), 1e-6), 1),
+            "warm_latency_mean_sec": round(float(np.mean(warm_lats)), 4),
+            "warm_latency_median_sec": round(float(np.median(warm_lats)), 4),
+            "warm_latency_std_sec": round(float(np.std(warm_lats)), 4),
+            "warm_latency_min_sec": round(float(np.min(warm_lats)), 4),
+            "warm_latency_max_sec": round(float(np.max(warm_lats)), 4),
+            "throughput_words_per_sec": round(out_words / max(float(np.mean(warm_lats)), 1e-6), 1),
             "peak_vram_mb": 0.0,
             "device": "cpu",
         })
@@ -188,23 +194,39 @@ def benchmark_abstractive_model(
             torch.cuda.synchronize()
         cold_lat = round(time.perf_counter() - cold_start, 4)
 
-        # Warm runs (3 repetitions)
+        # Warm runs (5 repetitions for high statistical fidelity)
         warm_latencies = []
         out_tokens_list = []
-        for _ in range(3):
+        gen_lats = []
+        tok_lats = []
+        dec_lats = []
+        e2e_lats = []
+
+        for _ in range(5):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
             w_res = summarizer.summarize_text(text, max_length=128, min_length=30)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-            warm_latencies.append(time.perf_counter() - t0)
+            elapsed_rep = time.perf_counter() - t0
+            warm_latencies.append(elapsed_rep)
             out_tokens_list.append(w_res["output_tokens"])
+            gen_lats.append(w_res.get("generation_latency_sec", elapsed_rep))
+            tok_lats.append(w_res.get("tokenization_latency_sec", 0.0))
+            dec_lats.append(w_res.get("decoding_latency_sec", 0.0))
+            e2e_lats.append(w_res.get("total_e2e_latency_sec", elapsed_rep))
 
         avg_warm = float(np.mean(warm_latencies))
+        med_warm = float(np.median(warm_latencies))
+        std_warm = float(np.std(warm_latencies))
+        min_warm = float(np.min(warm_latencies))
+        max_warm = float(np.max(warm_latencies))
+
         avg_tokens = float(np.mean(out_tokens_list))
         throughput_tok_sec = round(avg_tokens / max(avg_warm, 1e-6), 2)
         out_words = len(w_res["summary"].split())
+        input_tokens = cold_res.get("input_tokens", 0)
         peak_vram = get_max_vram_mb()
 
         results.append({
@@ -212,12 +234,20 @@ def benchmark_abstractive_model(
             "paradigm": "Abstractive Transformer",
             "document_length_category": doc_len_name,
             "input_words": input_words,
+            "input_tokens": input_tokens,
             "output_words": out_words,
+            "output_tokens": int(round(avg_tokens)),
             "init_time_sec": init_time,
             "cold_latency_sec": cold_lat,
             "warm_latency_mean_sec": round(avg_warm, 4),
-            "warm_latency_min_sec": round(float(np.min(warm_latencies)), 4),
-            "warm_latency_max_sec": round(float(np.max(warm_latencies)), 4),
+            "warm_latency_median_sec": round(med_warm, 4),
+            "warm_latency_std_sec": round(std_warm, 4),
+            "warm_latency_min_sec": round(min_warm, 4),
+            "warm_latency_max_sec": round(max_warm, 4),
+            "generation_latency_sec": round(float(np.mean(gen_lats)), 4),
+            "tokenization_latency_sec": round(float(np.mean(tok_lats)), 4),
+            "decoding_latency_sec": round(float(np.mean(dec_lats)), 4),
+            "total_e2e_latency_sec": round(float(np.mean(e2e_lats)), 4),
             "throughput_tokens_per_sec": throughput_tok_sec,
             "throughput_words_per_sec": round(out_words / max(avg_warm, 1e-6), 1),
             "peak_vram_mb": peak_vram,

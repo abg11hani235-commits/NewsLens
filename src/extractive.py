@@ -86,7 +86,7 @@ def lead_n_summarize(text: str, num_sentences: int = 3) -> str:
         str: Extracted summary string.
     """
     cleaned = clean_text(text)
-    if not cleaned:
+    if not cleaned or not any(c.isalnum() for c in cleaned):
         return ""
 
     sentences = split_into_sentences(cleaned)
@@ -153,7 +153,7 @@ def textrank_summarize(
         str: Extracted summary with original sentence sequence preserved.
     """
     cleaned = clean_text(text)
-    if not cleaned:
+    if not cleaned or not any(c.isalnum() for c in cleaned):
         return ""
 
     sentences = split_into_sentences(cleaned)

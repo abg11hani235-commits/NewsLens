@@ -16,8 +16,9 @@ import time
 import inspect
 import logging
 import threading
+import contextlib
 from collections import OrderedDict
-from typing import Dict, Any, Tuple, Optional, List
+from typing import Dict, Any, Tuple, Optional, List, Iterator
 from pathlib import Path
 
 # Add project root to sys.path
@@ -51,10 +52,13 @@ logger = logging.getLogger("newslens_app")
 # ==============================================================================
 
 class ModelManager:
-    """Thread-safe manager for neural summarization models with safe caching and resource management.
+    """Thread-safe manager for neural summarization models with safe caching, leasing, and resource management.
 
     Key Features:
-    - Thread-safe model acquisition and eviction via reentrant locks (threading.RLock).
+    - Safe Inference Lifecycle Leasing: `lease_model(model_key)` context manager ensures a model
+      currently used by an active inference request is never evicted by concurrent requests.
+    - Condition Variable Synchronization: Waiting threads gracefully block if all cached models
+      are actively leased, resuming immediately when the active lease releases.
     - Separation of model initialization/loading time from inference time.
     - Cold-start and warm-start latency tracking.
     - Memory-aware eviction (default max_cached_models=1 for constrained 6GB VRAM/cloud environments).
@@ -64,7 +68,9 @@ class ModelManager:
     def __init__(self, max_cached_models: int = 1):
         self.max_cached_models = max_cached_models
         self._lock = threading.RLock()
+        self._cond = threading.Condition(self._lock)
         self._cache: "OrderedDict[str, AbstractiveSummarizer]" = OrderedDict()
+        self._active_leases: Dict[str, int] = {}
         self._last_loaded_metadata: Dict[str, Any] = {}
 
     @property
@@ -89,6 +95,107 @@ class ModelManager:
     def active_summarizer(self, value: Optional[AbstractiveSummarizer]) -> None:
         pass
 
+    def is_leased(self, model_choice: str) -> bool:
+        """Check if a model currently has active leases."""
+        with self._lock:
+            return self._active_leases.get(model_choice.lower().strip(), 0) > 0
+
+    def get_lease_count(self, model_choice: str) -> int:
+        """Return the number of active leases for a model."""
+        with self._lock:
+            return self._active_leases.get(model_choice.lower().strip(), 0)
+
+    @contextlib.contextmanager
+    def lease_model(
+        self,
+        model_choice: str,
+        warmup: bool = False,
+        timeout: float = 60.0,
+    ) -> Iterator[Tuple[AbstractiveSummarizer, Dict[str, Any]]]:
+        """Lease a summarization model for the duration of inference.
+
+        Guarantees:
+        - The leased model CANNOT be evicted or unloaded by another thread while this lease is active.
+        - Other threads attempting to evict this model will safely wait on the condition variable.
+        - Once inference completes and the context exits, the lease is released and waiting threads are notified.
+
+        Args:
+            model_choice (str): 'bart' or 't5'.
+            warmup (bool): Whether to perform model warmup if loaded from scratch.
+            timeout (float): Max seconds to wait if all models are leased.
+
+        Yields:
+            Tuple[AbstractiveSummarizer, Dict[str, Any]]: (model_instance, metadata_dict)
+        """
+        model_key = model_choice.lower().strip()
+        if model_key not in ["bart", "t5"]:
+            raise ValueError(f"Invalid model choice '{model_choice}'. Choose 'bart' or 't5'.")
+
+        start_wait = time.perf_counter()
+        with self._lock:
+            # 1. If not cached and cache is at capacity, ensure an unleased model exists to evict
+            while model_key not in self._cache and len(self._cache) >= self.max_cached_models:
+                evictable = [k for k in self._cache if self._active_leases.get(k, 0) == 0]
+                if evictable:
+                    evict_k = evictable[0]
+                    evicted_model = self._cache.pop(evict_k)
+                    logger.info(f"Evicting idle model '{evict_k}' to free memory for '{model_key}'...")
+                    evicted_model.unload_model()
+                    break
+                else:
+                    remaining = timeout - (time.perf_counter() - start_wait)
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"Timed out after {timeout}s waiting for active leases on {list(self._cache.keys())} to release before loading '{model_key}'."
+                        )
+                    logger.info(
+                        f"All cached models {list(self._cache.keys())} are actively leased. Waiting for lease release before loading '{model_key}'..."
+                    )
+                    self._cond.wait(timeout=min(remaining, 5.0))
+
+            # 2. Retrieve from cache or load on demand
+            if model_key in self._cache:
+                summarizer = self._cache[model_key]
+                self._cache.move_to_end(model_key)
+                meta = {
+                    "model_key": model_key,
+                    "is_cached": True,
+                    "load_time_sec": 0.0,
+                    "init_time_sec": getattr(summarizer, "init_time_sec", 0.0),
+                    "is_warmed": summarizer.cold_latency_sec is not None,
+                }
+            else:
+                target_model_name = PRIMARY_MODEL_NAME if model_key == "bart" else ALTERNATIVE_MODEL_NAME
+                logger.info(f"Loading '{target_model_name}' on demand under lease...")
+                load_start = time.perf_counter()
+                summarizer = AbstractiveSummarizer(
+                    model_name=target_model_name,
+                    device=get_device(),
+                )
+                load_elapsed = round(time.perf_counter() - load_start, 3)
+                if warmup:
+                    summarizer.warmup()
+
+                self._cache[model_key] = summarizer
+                meta = {
+                    "model_key": model_key,
+                    "is_cached": False,
+                    "load_time_sec": load_elapsed,
+                    "init_time_sec": summarizer.init_time_sec,
+                    "is_warmed": summarizer.cold_latency_sec is not None,
+                }
+
+            # 3. Increment lease count
+            self._active_leases[model_key] = self._active_leases.get(model_key, 0) + 1
+            self._last_loaded_metadata = meta
+
+        try:
+            yield summarizer, meta
+        finally:
+            with self._lock:
+                self._active_leases[model_key] = max(0, self._active_leases.get(model_key, 1) - 1)
+                self._cond.notify_all()
+
     def get_model(
         self,
         model_choice: str,
@@ -112,6 +219,7 @@ class ModelManager:
         warmup: bool = False,
     ) -> Tuple[AbstractiveSummarizer, Dict[str, Any]]:
         """Retrieve model along with loading and cache metadata.
+        Respects active leases to prevent evicting in-use models.
 
         Returns:
             Tuple[AbstractiveSummarizer, Dict[str, Any]]: (model, metadata_dict)
@@ -135,10 +243,16 @@ class ModelManager:
                 self._last_loaded_metadata = meta
                 return summarizer, meta
 
-            # Evict least recently used model if capacity reached
+            # Evict least recently used model that is NOT actively leased
             while len(self._cache) >= self.max_cached_models:
-                evicted_key, evicted_model = self._cache.popitem(last=False)
-                logger.info(f"Evicting active model '{evicted_key}' to free memory...")
+                evictable = [k for k in self._cache if self._active_leases.get(k, 0) == 0]
+                if not evictable:
+                    logger.warning("All models in cache are currently leased. Evicting oldest to satisfy non-leased request.")
+                    evict_k = next(iter(self._cache))
+                else:
+                    evict_k = evictable[0]
+                evicted_model = self._cache.pop(evict_k)
+                logger.info(f"Evicting active model '{evict_k}' to free memory...")
                 evicted_model.unload_model()
 
             target_model_name = PRIMARY_MODEL_NAME if model_key == "bart" else ALTERNATIVE_MODEL_NAME
@@ -165,14 +279,18 @@ class ModelManager:
             self._last_loaded_metadata = meta
             return summarizer, meta
 
-    def unload_all(self) -> None:
+    def unload_all(self, force: bool = False) -> None:
         """Unload all active models completely and release resources."""
         with self._lock:
             for key, model in list(self._cache.items()):
+                if not force and self._active_leases.get(key, 0) > 0:
+                    logger.warning(f"Model '{key}' has active leases ({self._active_leases[key]}). Skipping unload.")
+                    continue
                 logger.info(f"Unloading model '{key}'...")
                 model.unload_model()
-            self._cache.clear()
-            self._last_loaded_metadata = {}
+                del self._cache[key]
+            if not self._cache:
+                self._last_loaded_metadata = {}
 
 
 # Global singleton instance
@@ -264,42 +382,44 @@ def summarize_article(
             latency_display = f"{elapsed:.3f} seconds (Graph PageRank)"
 
         elif "bart" in model_clean:
-            summarizer, meta = MODEL_MANAGER.get_model_with_metadata("bart")
-            res = summarizer.summarize_text(
-                cleaned,
-                max_length=max_length,
-                min_length=min_length,
-                num_beams=num_beams,
-            )
-            summary = res["summary"]
-            elapsed = res["latency_sec"]
-            device = res["device"]
-            load_time = meta["load_time_sec"]
-            is_cached = meta["is_cached"]
-            is_cold = res.get("is_cold", False)
+            with MODEL_MANAGER.lease_model("bart") as (summarizer, meta):
+                res = summarizer.summarize_text(
+                    cleaned,
+                    max_length=max_length,
+                    min_length=min_length,
+                    num_beams=num_beams,
+                )
+                summary = res["summary"]
+                elapsed = res["latency_sec"]
+                e2e_elapsed = res.get("total_e2e_latency_sec", elapsed)
+                device = res["device"]
+                load_time = meta["load_time_sec"]
+                is_cached = meta["is_cached"]
+                is_cold = res.get("is_cold", False)
 
-            load_str = "Load: 0.00s (Cached)" if is_cached else f"Load: {load_time:.2f}s (Cold)"
-            lat_type = "Cold" if is_cold else "Warm"
-            latency_display = f"{elapsed:.3f}s ({lat_type} Inference) | {load_str}"
+                load_str = "Load: 0.00s (Cached)" if is_cached else f"Load: {load_time:.2f}s (Cold)"
+                lat_type = "Cold" if is_cold else "Warm"
+                latency_display = f"Gen: {elapsed:.3f}s ({lat_type}) | E2E: {e2e_elapsed:.3f}s | {load_str}"
 
         elif "t5" in model_clean:
-            summarizer, meta = MODEL_MANAGER.get_model_with_metadata("t5")
-            res = summarizer.summarize_text(
-                cleaned,
-                max_length=max_length,
-                min_length=min_length,
-                num_beams=num_beams,
-            )
-            summary = res["summary"]
-            elapsed = res["latency_sec"]
-            device = res["device"]
-            load_time = meta["load_time_sec"]
-            is_cached = meta["is_cached"]
-            is_cold = res.get("is_cold", False)
+            with MODEL_MANAGER.lease_model("t5") as (summarizer, meta):
+                res = summarizer.summarize_text(
+                    cleaned,
+                    max_length=max_length,
+                    min_length=min_length,
+                    num_beams=num_beams,
+                )
+                summary = res["summary"]
+                elapsed = res["latency_sec"]
+                e2e_elapsed = res.get("total_e2e_latency_sec", elapsed)
+                device = res["device"]
+                load_time = meta["load_time_sec"]
+                is_cached = meta["is_cached"]
+                is_cold = res.get("is_cold", False)
 
-            load_str = "Load: 0.00s (Cached)" if is_cached else f"Load: {load_time:.2f}s (Cold)"
-            lat_type = "Cold" if is_cold else "Warm"
-            latency_display = f"{elapsed:.3f}s ({lat_type} Inference) | {load_str}"
+                load_str = "Load: 0.00s (Cached)" if is_cached else f"Load: {load_time:.2f}s (Cold)"
+                lat_type = "Cold" if is_cold else "Warm"
+                latency_display = f"Gen: {elapsed:.3f}s ({lat_type}) | E2E: {e2e_elapsed:.3f}s | {load_str}"
 
         else:
             raise gr.Error(f"Unsupported model: {model_choice}")
@@ -350,31 +470,31 @@ def compare_all_models(
     textrank_sum = textrank_summarize(cleaned, num_sentences=num_sentences)
     textrank_lat = time.perf_counter() - t0
 
-    # 3. T5-Small (Lazy load, run, then unload before BART)
-    t5_model, t5_meta = MODEL_MANAGER.get_model_with_metadata("t5")
-    t5_res = t5_model.summarize_text(
-        cleaned,
-        max_length=max_length,
-        min_length=min_length,
-        num_beams=num_beams,
-    )
-    t5_sum = t5_res["summary"]
-    t5_lat = t5_res["latency_sec"]
-    t5_dev = t5_res["device"]
-    t5_status = "Cached" if t5_meta["is_cached"] else f"{t5_meta['load_time_sec']:.2f}s Load"
+    # 3. T5-Small (Lazy load, run, then safely release lease before BART)
+    with MODEL_MANAGER.lease_model("t5") as (t5_model, t5_meta):
+        t5_res = t5_model.summarize_text(
+            cleaned,
+            max_length=max_length,
+            min_length=min_length,
+            num_beams=num_beams,
+        )
+        t5_sum = t5_res["summary"]
+        t5_lat = t5_res["latency_sec"]
+        t5_dev = t5_res["device"]
+        t5_status = "Cached" if t5_meta["is_cached"] else f"{t5_meta['load_time_sec']:.2f}s Load"
 
-    # 4. BART-Large-CNN (ModelManager evicts T5 to avoid memory conflict)
-    bart_model, bart_meta = MODEL_MANAGER.get_model_with_metadata("bart")
-    bart_res = bart_model.summarize_text(
-        cleaned,
-        max_length=max_length,
-        min_length=min_length,
-        num_beams=num_beams,
-    )
-    bart_sum = bart_res["summary"]
-    bart_lat = bart_res["latency_sec"]
-    bart_dev = bart_res["device"]
-    bart_status = "Cached" if bart_meta["is_cached"] else f"{bart_meta['load_time_sec']:.2f}s Load"
+    # 4. BART-Large-CNN (ModelManager safely evicts idle T5 once its lease is released)
+    with MODEL_MANAGER.lease_model("bart") as (bart_model, bart_meta):
+        bart_res = bart_model.summarize_text(
+            cleaned,
+            max_length=max_length,
+            min_length=min_length,
+            num_beams=num_beams,
+        )
+        bart_sum = bart_res["summary"]
+        bart_lat = bart_res["latency_sec"]
+        bart_dev = bart_res["device"]
+        bart_status = "Cached" if bart_meta["is_cached"] else f"{bart_meta['load_time_sec']:.2f}s Load"
 
     # Construct comparison summary table
     table_md = f"""

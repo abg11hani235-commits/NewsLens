@@ -15,6 +15,7 @@ import sys
 import time
 import gc
 import logging
+import threading
 from typing import List, Dict, Any, Optional, Union
 from pathlib import Path
 
@@ -91,6 +92,7 @@ class AbstractiveSummarizer:
             f"Loading model '{self.model_name}' on {self.device} (FP16={self.use_fp16}, max_input={self.max_input_length})..."
         )
 
+        self._inference_lock = threading.Lock()
         init_start = time.perf_counter()
         self._load_model_and_tokenizer()
         self.init_time_sec = round(time.perf_counter() - init_start, 3)
@@ -148,112 +150,170 @@ class AbstractiveSummarizer:
         text: str,
         **override_kwargs,
     ) -> Dict[str, Any]:
-        """Summarize a single document with inference timing and resource tracking.
+        """Summarize a single document with granular inference timing and resource tracking.
+
+        Tracks end-to-end stages:
+        - preprocessing_latency_sec: text cleaning and task prefixing
+        - tokenization_latency_sec: tokenizer encoding and tensor transfer
+        - generation_latency_sec: model forward generation loop
+        - decoding_latency_sec: tokenizer detokenization
+        - total_e2e_latency_sec: full pipeline turnaround time
+
+        Robust CUDA OOM recovery:
+        - If CUDA OOM occurs, converts model weights to FP32 and moves to CPU.
+          (Essential because standard CPUs do not support native Half-precision operations).
+        - Safely generates summary on CPU.
+        - Attempts to restore model back to original device and dtype.
+        - Updates device status truthfully (e.g. 'cpu (oom-fallback-fp32, restored to cuda:0)'
+          vs 'cpu (oom-fallback-fp32, persistent)').
 
         Args:
             text (str): Input article text.
             **override_kwargs: Optional generation parameter overrides.
 
         Returns:
-            Dict[str, Any]: Dictionary containing 'summary', 'latency_sec',
+            Dict[str, Any]: Dictionary containing 'summary', 'latency_sec', granular latencies,
                             'input_tokens', 'output_tokens', and 'device'.
         """
         if not text or not text.strip():
             return {
                 "summary": "",
                 "latency_sec": 0.0,
+                "generation_latency_sec": 0.0,
+                "preprocessing_latency_sec": 0.0,
+                "tokenization_latency_sec": 0.0,
+                "decoding_latency_sec": 0.0,
+                "total_e2e_latency_sec": 0.0,
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "device": str(self.device),
+                "init_time_sec": getattr(self, "init_time_sec", 0.0),
+                "is_cold": False,
+                "warm_latency_avg": 0.0,
             }
 
+        e2e_start = time.perf_counter()
+
+        # 1. Preprocessing stage
+        prep_start = time.perf_counter()
         prepared_text = self._prepare_input_text(text)
+        prep_latency_sec = time.perf_counter() - prep_start
+
         gen_params = dict(self.generation_params)
         gen_params.update(override_kwargs)
 
-        # Tokenize input
-        inputs = self.tokenizer(
-            prepared_text,
-            max_length=self.max_input_length,
-            truncation=True,
-            return_tensors="pt",
-        ).to(self.device)
+        with self._inference_lock:
+            # 2. Tokenization stage
+            tok_start = time.perf_counter()
+            inputs = self.tokenizer(
+                prepared_text,
+                max_length=self.max_input_length,
+                truncation=True,
+                return_tensors="pt",
+            ).to(self.device)
+            tok_latency_sec = time.perf_counter() - tok_start
 
-        input_token_count = inputs["input_ids"].shape[1]
+            input_token_count = inputs["input_ids"].shape[1]
 
-        # Synchronize CUDA device before timing to ensure accurate latency measurement
-        if self.is_cuda:
-            torch.cuda.synchronize(self.device)
+            # Synchronize CUDA device before timing generation
+            if self.is_cuda:
+                torch.cuda.synchronize(self.device)
 
-        start_time = time.perf_counter()
-        used_cpu_fallback = False
-        is_cold = (self.inference_count == 0 and self.cold_latency_sec is None)
-
-        try:
-            with torch.inference_mode():
-                summary_ids = self.model.generate(
-                    inputs["input_ids"],
-                    attention_mask=inputs.get("attention_mask"),
-                    **gen_params,
-                )
-        except torch.cuda.OutOfMemoryError:
-            used_cpu_fallback = True
-            logger.warning(
-                "CUDA Out-Of-Memory (OOM) encountered on GPU! Initiating safe CPU fallback..."
-            )
-            torch.cuda.empty_cache()
-
-            # Safely transfer all input tensors (including attention_mask) to CPU
-            cpu_inputs = {k: v.to("cpu") for k, v in inputs.items()}
+            gen_start = time.perf_counter()
+            used_cpu_fallback = False
+            restore_failed = False
             original_device = self.device
+            original_dtype = torch.float16 if (self.use_fp16 and self.is_cuda) else torch.float32
+            is_cold = (self.inference_count == 0 and self.cold_latency_sec is None)
 
             try:
-                # Move model to CPU for execution
-                self.model.to("cpu")
                 with torch.inference_mode():
                     summary_ids = self.model.generate(
-                        cpu_inputs["input_ids"],
-                        attention_mask=cpu_inputs.get("attention_mask"),
+                        inputs["input_ids"],
+                        attention_mask=inputs.get("attention_mask"),
                         **gen_params,
                     )
-            finally:
-                # Attempt to restore model to original GPU device if memory permits
+            except torch.cuda.OutOfMemoryError:
+                used_cpu_fallback = True
+                logger.warning(
+                    "CUDA Out-Of-Memory (OOM) encountered on GPU! Initiating safe FP32 CPU fallback..."
+                )
+                torch.cuda.empty_cache()
+
+                # Safely transfer all input tensors to CPU
+                cpu_inputs = {k: v.to("cpu") for k, v in inputs.items()}
+
                 try:
-                    torch.cuda.empty_cache()
-                    self.model.to(original_device)
-                except Exception as restore_err:
-                    logger.warning(
-                        f"Could not restore model back to {original_device} ({restore_err}). Remaining on CPU."
-                    )
-                    self.device = torch.device("cpu")
-                    self.is_cuda = False
+                    # Move model to CPU and convert weights to FP32 (CPU does not support FP16 ops)
+                    self.model.to("cpu", dtype=torch.float32)
+                    with torch.inference_mode():
+                        summary_ids = self.model.generate(
+                            cpu_inputs["input_ids"],
+                            attention_mask=cpu_inputs.get("attention_mask"),
+                            **gen_params,
+                        )
+                finally:
+                    # Attempt to restore model back to original device and precision
+                    try:
+                        torch.cuda.empty_cache()
+                        self.model.to(original_device, dtype=original_dtype)
+                        logger.info(
+                            f"Model successfully restored back to {original_device} (dtype={original_dtype})."
+                        )
+                    except Exception as restore_err:
+                        restore_failed = True
+                        logger.warning(
+                            f"Could not restore model back to {original_device} ({restore_err}). "
+                            "Remaining persistently on CPU in FP32."
+                        )
+                        self.device = torch.device("cpu")
+                        self.is_cuda = False
+                        self.use_fp16 = False
 
-        # Synchronize CUDA device after generation to guarantee completed kernel execution
-        if self.is_cuda and not used_cpu_fallback:
-            torch.cuda.synchronize(self.device)
+            # Synchronize CUDA device after generation to guarantee completed kernel execution
+            if self.is_cuda and not used_cpu_fallback:
+                torch.cuda.synchronize(self.device)
 
-        elapsed = time.perf_counter() - start_time
-        output_token_count = summary_ids.shape[1]
+            gen_latency_sec = time.perf_counter() - gen_start
+            output_token_count = summary_ids.shape[1]
 
-        summary_text = self.tokenizer.decode(summary_ids[0], skip_special_tokens=True).strip()
+            # 3. Decoding stage
+            dec_start = time.perf_counter()
+            summary_text = self.tokenizer.decode(summary_ids[0], skip_special_tokens=True).strip()
+            dec_latency_sec = time.perf_counter() - dec_start
 
-        # Update cold vs warm latency statistics
-        self.inference_count += 1
-        latency_val = round(elapsed, 3)
-        if is_cold:
-            self.cold_latency_sec = latency_val
+            total_e2e_latency_sec = time.perf_counter() - e2e_start
+
+            # Update cold vs warm latency statistics
+            self.inference_count += 1
+            gen_latency_val = round(gen_latency_sec, 3)
+            if is_cold:
+                self.cold_latency_sec = gen_latency_val
+            else:
+                self.warm_latencies.append(gen_latency_val)
+
+            # Cleanup local tensors
+            del inputs, summary_ids
+
+        # Determine truthful device status
+        if used_cpu_fallback:
+            if restore_failed:
+                device_str = "cpu (oom-fallback-fp32, persistent)"
+            else:
+                device_str = f"cpu (oom-fallback-fp32, restored to {original_device})"
         else:
-            self.warm_latencies.append(latency_val)
+            device_str = str(self.device)
 
-        # Retain tensor memory for caching allocator without calling empty_cache on hot path
-        del inputs, summary_ids
-
-        device_str = "cpu (oom-fallback)" if used_cpu_fallback else str(self.device)
-        warm_avg = round(float(sum(self.warm_latencies) / len(self.warm_latencies)), 3) if self.warm_latencies else latency_val
+        warm_avg = round(float(sum(self.warm_latencies) / len(self.warm_latencies)), 3) if self.warm_latencies else gen_latency_val
 
         return {
             "summary": summary_text,
-            "latency_sec": latency_val,
+            "latency_sec": gen_latency_val,  # Primary backward-compatible key
+            "generation_latency_sec": gen_latency_val,
+            "preprocessing_latency_sec": round(prep_latency_sec, 4),
+            "tokenization_latency_sec": round(tok_latency_sec, 4),
+            "decoding_latency_sec": round(dec_latency_sec, 4),
+            "total_e2e_latency_sec": round(total_e2e_latency_sec, 3),
             "input_tokens": input_token_count,
             "output_tokens": output_token_count,
             "device": device_str,
@@ -302,6 +362,9 @@ class AbstractiveSummarizer:
         Returns:
             List[Dict[str, Any]]: Ordered list of summarization result dictionaries.
         """
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be at least 1, got {batch_size}")
+
         if not texts:
             return []
 
@@ -315,6 +378,7 @@ class AbstractiveSummarizer:
             chunk_indices = list(range(chunk_start, min(chunk_start + batch_size, total)))
             valid_sub_indices = []
             valid_prepared_texts = []
+            chunk_e2e_start = time.perf_counter()
 
             for rel_idx, idx in enumerate(chunk_indices):
                 raw_text = texts[idx]
@@ -325,6 +389,11 @@ class AbstractiveSummarizer:
                     results[idx] = {
                         "summary": "",
                         "latency_sec": 0.0,
+                        "generation_latency_sec": 0.0,
+                        "preprocessing_latency_sec": 0.0,
+                        "tokenization_latency_sec": 0.0,
+                        "decoding_latency_sec": 0.0,
+                        "total_e2e_latency_sec": 0.0,
                         "input_tokens": 0,
                         "output_tokens": 0,
                         "device": str(self.device),
@@ -337,6 +406,7 @@ class AbstractiveSummarizer:
 
             try:
                 # Vectorized batch tokenization with dynamic padding
+                tok_start = time.perf_counter()
                 batch_inputs = self.tokenizer(
                     valid_prepared_texts,
                     max_length=self.max_input_length,
@@ -344,6 +414,7 @@ class AbstractiveSummarizer:
                     truncation=True,
                     return_tensors="pt",
                 ).to(self.device)
+                tok_elapsed = time.perf_counter() - tok_start
 
                 if self.is_cuda:
                     torch.cuda.synchronize(self.device)
@@ -362,9 +433,13 @@ class AbstractiveSummarizer:
                 per_item_latency = round(batch_elapsed / len(valid_prepared_texts), 3)
 
                 # Batch decoding
+                dec_start = time.perf_counter()
                 batch_summaries = self.tokenizer.batch_decode(
                     batch_summary_ids, skip_special_tokens=True
                 )
+                dec_elapsed = time.perf_counter() - dec_start
+                chunk_total_elapsed = time.perf_counter() - chunk_e2e_start
+                per_item_e2e = round(chunk_total_elapsed / len(valid_prepared_texts), 3)
 
                 for k, sub_idx in enumerate(valid_sub_indices):
                     global_idx = chunk_indices[sub_idx]
@@ -378,6 +453,11 @@ class AbstractiveSummarizer:
                     results[global_idx] = {
                         "summary": batch_summaries[k].strip(),
                         "latency_sec": per_item_latency,
+                        "generation_latency_sec": per_item_latency,
+                        "preprocessing_latency_sec": 0.0,
+                        "tokenization_latency_sec": round(tok_elapsed / len(valid_prepared_texts), 4),
+                        "decoding_latency_sec": round(dec_elapsed / len(valid_prepared_texts), 4),
+                        "total_e2e_latency_sec": per_item_e2e,
                         "input_tokens": in_toks,
                         "output_tokens": out_toks,
                         "device": str(self.device),
@@ -411,6 +491,11 @@ class AbstractiveSummarizer:
                         results[global_idx] = {
                             "summary": f"[Error: {str(single_err)}]",
                             "latency_sec": 0.0,
+                            "generation_latency_sec": 0.0,
+                            "preprocessing_latency_sec": 0.0,
+                            "tokenization_latency_sec": 0.0,
+                            "decoding_latency_sec": 0.0,
+                            "total_e2e_latency_sec": 0.0,
                             "input_tokens": 0,
                             "output_tokens": 0,
                             "device": str(self.device),
