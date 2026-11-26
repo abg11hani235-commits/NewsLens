@@ -10,6 +10,7 @@ Features:
 - Interactive Academic Benchmark & Architecture Guide.
 """
 
+import os
 import sys
 import gc
 import time
@@ -21,6 +22,24 @@ import contextlib
 from collections import OrderedDict
 from typing import Dict, Any, Tuple, Optional, List, Iterator
 from pathlib import Path
+
+# ZeroGPU Rule 1: import spaces BEFORE any CUDA-touching import (torch/config/transformers)
+try:
+    import spaces
+except ImportError:
+    if os.environ.get("SPACES_ZERO_GPU") == "1":
+        raise
+    spaces = None
+
+IS_ZEROGPU = os.environ.get("SPACES_ZERO_GPU") == "1"
+
+
+def gpu_task(duration: int = 60):
+    """Apply @spaces.GPU decorator when running on Hugging Face ZeroGPU, else no-op."""
+    if spaces is not None:
+        return spaces.GPU(duration=duration)
+    return lambda fn: fn
+
 
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -531,7 +550,16 @@ class ModelManager:
 
 
 # Global singleton instance
-MODEL_MANAGER = ModelManager()
+MODEL_MANAGER = ModelManager(max_cached_models=2 if IS_ZEROGPU else 1)
+
+if IS_ZEROGPU:
+    # ZeroGPU Rule 2: Eagerly load models at module scope so weights are packed before worker fork
+    ensure_nltk_resources()
+    logger.info("ZeroGPU environment detected: preloading T5 and BART at module scope...")
+    with MODEL_MANAGER.lease_model("t5"):
+        pass
+    with MODEL_MANAGER.lease_model("bart"):
+        pass
 
 # ==============================================================================
 # Sample Benchmark News Articles
@@ -579,6 +607,7 @@ def update_text_counts(text: str) -> str:
     return f"Word Count: {words:,} | Character Count: {chars:,}"
 
 
+@gpu_task(duration=45)
 def summarize_article(
     article_text: str,
     model_choice: str,
@@ -674,6 +703,7 @@ def summarize_article(
         raise gr.Error(f"Summarization Error: {str(e)}")
 
 
+@gpu_task(duration=60)
 def compare_all_models(
     article_text: str,
     num_sentences: int = 3,
@@ -985,17 +1015,22 @@ def create_ui() -> gr.Blocks:
 
 
 def launch_app(
-    server_name: str = "127.0.0.1",
-    server_port: int = 7860,
+    server_name: Optional[str] = None,
+    server_port: Optional[int] = None,
     share: bool = False,
 ) -> None:
     """Launch the NewsLens Gradio application."""
+    ensure_nltk_resources()
     demo = create_ui()
     demo.queue()
 
-    launch_kwargs = {
-        "server_name": server_name,
-        "server_port": server_port,
+    is_hf_space = bool(os.environ.get("SPACE_ID") or os.environ.get("SPACES_ZERO_GPU"))
+    resolved_host = server_name or ("0.0.0.0" if is_hf_space else "127.0.0.1")
+    resolved_port = server_port or int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
+
+    launch_kwargs: Dict[str, Any] = {
+        "server_name": resolved_host,
+        "server_port": resolved_port,
         "share": share,
     }
     sig = inspect.signature(gr.Blocks.launch).parameters

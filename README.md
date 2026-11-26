@@ -2,9 +2,10 @@
 title: NewsLens - AI-Powered News Summarization
 emoji: 📰
 colorFrom: indigo
-colorTo: slate
+colorTo: blue
 sdk: gradio
 sdk_version: 6.32.0
+python_version: '3.12'
 app_file: app.py
 pinned: false
 license: mit

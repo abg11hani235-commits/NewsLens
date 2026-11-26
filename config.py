@@ -108,7 +108,7 @@ GENERATION_PARAMS = dict(GENERATION_PARAMS_QUALITY)
 def get_device() -> torch.device:
     """Detect and return the optimal compute device (CUDA GPU if available, else CPU)."""
     if torch.cuda.is_available():
-        return torch.device("cuda:0")
+        return torch.device("cuda")
     return torch.device("cpu")
 
 DEVICE = get_device()

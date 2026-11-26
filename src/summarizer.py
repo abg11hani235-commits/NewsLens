@@ -135,8 +135,11 @@ class AbstractiveSummarizer:
         self.model.eval()
 
         if self.is_cuda:
-            vram_mb = torch.cuda.memory_allocated(self.device) / (1024 * 1024)
-            logger.info(f"Model loaded into GPU VRAM: {vram_mb:.1f} MB allocated.")
+            try:
+                vram_mb = torch.cuda.memory_allocated(self.device) / (1024 * 1024)
+                logger.info(f"Model loaded into GPU VRAM: {vram_mb:.1f} MB allocated.")
+            except Exception as mem_err:
+                logger.debug(f"VRAM telemetry deferred/unavailable during initialization: {mem_err}")
 
     def _prepare_input_text(self, text: str) -> str:
         """Preprocess text and prepend task prefixes where required (e.g. T5)."""
