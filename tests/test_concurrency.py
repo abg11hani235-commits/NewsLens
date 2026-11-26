@@ -11,6 +11,7 @@ Verifies:
 import time
 import logging
 import threading
+from typing import Optional, List, Dict, Any
 from unittest.mock import MagicMock, patch
 import pytest
 import torch
@@ -25,8 +26,13 @@ class MockSummarizer:
         self.model_name = model_name
         self.init_time_sec = 0.05
         self.cold_latency_sec = 0.1
+        self.warm_latencies = []
+        self.inference_count = 0
         self.is_unloaded = False
         self._inference_lock = threading.RLock()
+
+    def warmup(self, sample_text: Optional[str] = None) -> float:
+        return 0.05
 
     @property
     def is_inferring(self) -> bool:
@@ -594,4 +600,117 @@ def test_no_leaked_leases_or_deadlocks_after_exception():
             assert t5_model.model_name == "google-t5/t5-small"
 
         assert not mgr.is_leased("t5")
+
+
+# ==============================================================================
+# SafeModelProxy Resource-Lifecycle & Boundary Security Tests
+# ==============================================================================
+
+def test_proxy_raw_model_access_rejected():
+    """Verify that accessing proxy.model raises RuntimeError and does not expose raw weights."""
+    mgr = ModelManager(max_cached_models=1)
+
+    with patch("app.AbstractiveSummarizer", side_effect=lambda model_name, **kw: MockSummarizer(model_name)):
+        proxy = mgr.get_model("t5")
+        with pytest.raises(RuntimeError, match="Direct access to raw model weights on 'SafeModelProxy' is disabled"):
+            _ = proxy.model
+
+
+def test_proxy_raw_tokenizer_access_rejected():
+    """Verify that accessing proxy.tokenizer raises RuntimeError and does not expose raw tokenizer."""
+    mgr = ModelManager(max_cached_models=1)
+
+    with patch("app.AbstractiveSummarizer", side_effect=lambda model_name, **kw: MockSummarizer(model_name)):
+        proxy = mgr.get_model("t5")
+        with pytest.raises(RuntimeError, match="Direct access to raw tokenizer on 'SafeModelProxy' is disabled"):
+            _ = proxy.tokenizer
+
+
+def test_proxy_getattr_bound_methods_and_internals_rejected():
+    """Verify that __getattr__ rejects bound methods and raw model internals with clear guidance."""
+    mgr = ModelManager(max_cached_models=1)
+
+    with patch("app.AbstractiveSummarizer", side_effect=lambda model_name, **kw: MockSummarizer(model_name)):
+        proxy = mgr.get_model("t5")
+
+        unsupported_attributes = [
+            "generate",
+            "forward",
+            "_load_model_and_tokenizer",
+            "to",
+            "eval",
+            "parameters",
+            "state_dict",
+        ]
+        for attr in unsupported_attributes:
+            with pytest.raises(AttributeError, match="does not expose raw model internal or method"):
+                _ = getattr(proxy, attr)
+
+
+def test_proxy_safe_metadata_attributes_accessible():
+    """Verify that whitelisted safe metadata attributes can be safely read on SafeModelProxy."""
+    mgr = ModelManager(max_cached_models=1)
+
+    with patch("app.AbstractiveSummarizer", side_effect=lambda model_name, **kw: MockSummarizer(model_name)):
+        proxy = mgr.get_model("t5")
+        assert proxy.model_name == "google-t5/t5-small"
+        assert proxy.device is not None
+        assert proxy.is_t5 is True
+        assert proxy.max_input_length > 0
+        assert isinstance(proxy.generation_params, dict)
+        assert proxy.cold_latency_sec is not None or proxy.cold_latency_sec is None
+        assert isinstance(proxy.warm_latencies, list)
+        assert isinstance(proxy.inference_count, int)
+        assert isinstance(proxy.is_unloaded, bool)
+        assert isinstance(proxy.is_inferring, bool)
+
+
+def test_proxy_exceptions_do_not_leak_leases():
+    """Verify that an exception raised during proxy.summarize_text does not leak leases or cause deadlock."""
+    mgr = ModelManager(max_cached_models=1)
+
+    with patch("app.AbstractiveSummarizer", side_effect=lambda model_name, **kw: MockSummarizer(model_name)):
+        proxy = mgr.get_model("bart")
+
+        def exploding_summarize(*args, **kwargs):
+            raise ValueError("Explosion during proxy inference")
+
+        cached_model = mgr._cache["bart"]
+        with patch.object(cached_model, "summarize_text", side_effect=exploding_summarize):
+            with pytest.raises(ValueError, match="Explosion during proxy inference"):
+                proxy.summarize_text("Sample text")
+
+        # Lease must be 0 and is_leased False
+        assert not mgr.is_leased("bart")
+        assert mgr.get_lease_count("bart") == 0
+
+        # Subsequent inference on another model succeeds without timing out
+        t5_proxy = mgr.get_model("t5")
+        res = t5_proxy.summarize_text("Testing clean recovery after error")
+        assert "t5" in res["summary"]
+
+
+def test_proxy_supported_legacy_apis_continue_working():
+    """Verify that all supported methods on SafeModelProxy work as expected."""
+    mgr = ModelManager(max_cached_models=1)
+
+    with patch("app.AbstractiveSummarizer", side_effect=lambda model_name, **kw: MockSummarizer(model_name)):
+        proxy = mgr.get_model("t5")
+
+        # 1. summarize_text
+        res_single = proxy.summarize_text("Single article test")
+        assert len(res_single["summary"]) > 0
+
+        # 2. summarize_batch
+        res_batch = proxy.summarize_batch(["Article 1", "Article 2"])
+        assert len(res_batch) == 2
+
+        # 3. warmup
+        warmup_res = proxy.warmup("Warmup article")
+        assert warmup_res >= 0.0
+
+        # 4. unload_model
+        assert not proxy.is_unloaded
+        proxy.unload_model()
+        assert proxy.is_unloaded
 

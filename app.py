@@ -57,10 +57,33 @@ class SafeModelProxy(AbstractiveSummarizer):
     """Lifecycle-safe proxy wrapper for legacy ModelManager model retrieval.
 
     Protects callers using deprecated get_model() / get_model_with_metadata()
-    by routing all inference operations through ModelManager.lease_model().
+    by routing supported inference operations through ModelManager.lease_model().
     This prevents concurrent eviction, use-after-unload conditions, or
     accessing deallocated tokenizers during in-flight inference requests.
+
+    Security & Resource Lifecycle Guarantees:
+    - Raw model weights (.model) and tokenizers (.tokenizer) are strictly shielded
+      and cannot be accessed directly outside of an active lease context.
+    - Bound methods, PyTorch internals, and mutable resources cannot be extracted
+      or invoked via dynamic attribute access without holding an active lease.
+    - Only explicitly whitelisted, safe metadata and configuration attributes are exposed.
     """
+
+    SAFE_METADATA_ATTRIBUTES = frozenset({
+        "model_name",
+        "device",
+        "is_cuda",
+        "is_t5",
+        "max_input_length",
+        "generation_params",
+        "init_time_sec",
+        "cold_latency_sec",
+        "warm_latencies",
+        "inference_count",
+        "is_unloaded",
+        "is_inferring",
+        "use_fp16",
+    })
 
     def __init__(self, manager: "ModelManager", model_key: str):
         self._manager = manager
@@ -69,6 +92,7 @@ class SafeModelProxy(AbstractiveSummarizer):
         self.device = get_device()
         self.is_cuda = (self.device.type == "cuda")
         self.is_t5 = "t5" in self.model_name.lower()
+        self.use_fp16 = self.is_cuda
         self.max_input_length = T5_MAX_INPUT_LENGTH if self.is_t5 else BART_MAX_INPUT_LENGTH
         self.generation_params = dict(GENERATION_PARAMS)
         self._fallback_lock = threading.RLock()
@@ -89,15 +113,17 @@ class SafeModelProxy(AbstractiveSummarizer):
     def is_unloaded(self) -> bool:
         with self._manager._lock:
             cached = self._manager._cache.get(self._model_key)
-            if cached is not None and hasattr(cached, "is_unloaded"):
-                return cached.is_unloaded
-            if self._last_instance is not None and hasattr(self._last_instance, "is_unloaded"):
-                return self._last_instance.is_unloaded
+            if cached is not None:
+                return getattr(cached, "is_unloaded", False)
+            if self._last_instance is not None:
+                return getattr(self._last_instance, "is_unloaded", True)
         return True
 
     @property
     def is_inferring(self) -> bool:
         with self._manager._lock:
+            if self._manager._active_leases.get(self._model_key, 0) > 0:
+                return True
             cached = self._manager._cache.get(self._model_key)
             if cached is not None and hasattr(cached, "is_inferring"):
                 return cached.is_inferring
@@ -107,39 +133,63 @@ class SafeModelProxy(AbstractiveSummarizer):
     def cold_latency_sec(self) -> Optional[float]:
         with self._manager._lock:
             cached = self._manager._cache.get(self._model_key)
-            return cached.cold_latency_sec if cached else None
+            if cached is not None and hasattr(cached, "cold_latency_sec"):
+                return cached.cold_latency_sec
+        return None
 
     @property
     def warm_latencies(self) -> List[float]:
         with self._manager._lock:
             cached = self._manager._cache.get(self._model_key)
-            return cached.warm_latencies if cached else []
+            if cached is not None and hasattr(cached, "warm_latencies"):
+                return list(cached.warm_latencies)
+        return []
 
     @property
     def inference_count(self) -> int:
         with self._manager._lock:
             cached = self._manager._cache.get(self._model_key)
-            return cached.inference_count if cached else 0
+            if cached is not None and hasattr(cached, "inference_count"):
+                return cached.inference_count
+        return 0
+
+    @property
+    def _load_model_and_tokenizer(self) -> Any:
+        raise AttributeError(
+            f"'{self.__class__.__name__}' does not expose raw model internal or method '_load_model_and_tokenizer'. "
+            "Returning bound methods or internal mutable resources outside an active lease causes "
+            "use-after-unload race conditions and GPU memory corruption. "
+            f"Use 'with MODEL_MANAGER.lease_model(\"{self._model_key}\") as (model, meta):' "
+            "to access model internals safely while holding an active lease."
+        )
+
+    @property
+    def _prepare_input_text(self) -> Any:
+        raise AttributeError(
+            f"'{self.__class__.__name__}' does not expose raw model internal or method '_prepare_input_text'. "
+            "Returning bound methods or internal mutable resources outside an active lease causes "
+            "use-after-unload race conditions and GPU memory corruption. "
+            f"Use 'with MODEL_MANAGER.lease_model(\"{self._model_key}\") as (model, meta):' "
+            "to access model internals safely while holding an active lease."
+        )
 
     @property
     def model(self) -> Any:
-        with self._manager._lock:
-            cached = self._manager._cache.get(self._model_key)
-            if cached is not None and hasattr(cached, "model"):
-                return cached.model
-            if self._last_instance is not None and hasattr(self._last_instance, "model"):
-                return self._last_instance.model
-        return None
+        raise RuntimeError(
+            f"Direct access to raw model weights on '{self.__class__.__name__}' is disabled "
+            "to prevent use-after-unload race conditions and GPU memory corruption outside active leases. "
+            f"Use 'with MODEL_MANAGER.lease_model(\"{self._model_key}\") as (model, meta):' "
+            "to safely access model internals under an active lease."
+        )
 
     @property
     def tokenizer(self) -> Any:
-        with self._manager._lock:
-            cached = self._manager._cache.get(self._model_key)
-            if cached is not None and hasattr(cached, "tokenizer"):
-                return cached.tokenizer
-            if self._last_instance is not None and hasattr(self._last_instance, "tokenizer"):
-                return self._last_instance.tokenizer
-        return None
+        raise RuntimeError(
+            f"Direct access to raw tokenizer on '{self.__class__.__name__}' is disabled "
+            "to prevent race conditions and accessing deallocated resources outside active leases. "
+            f"Use 'with MODEL_MANAGER.lease_model(\"{self._model_key}\") as (model, meta):' "
+            "to safely access tokenizer internals under an active lease."
+        )
 
     def summarize_text(self, text: str, **kwargs) -> Dict[str, Any]:
         with self._manager.lease_model(self._model_key) as (model, _):
@@ -154,21 +204,41 @@ class SafeModelProxy(AbstractiveSummarizer):
     def warmup(self, sample_text: Optional[str] = None) -> float:
         with self._manager.lease_model(self._model_key, warmup=False) as (model, _):
             self._last_instance = model
-            return model.warmup(sample_text=sample_text)
+            if hasattr(model, "warmup"):
+                return model.warmup(sample_text=sample_text)
+            return 0.0
 
     def unload_model(self) -> None:
         self._manager.unload_model(self._model_key)
 
+    def is_inferencing(self) -> bool:
+        return self.is_inferring
+
     def __getattr__(self, name: str) -> Any:
-        with self._manager._lock:
-            cached = self._manager._cache.get(self._model_key)
-            if cached is not None and hasattr(cached, name):
-                return getattr(cached, name)
-            if self._last_instance is not None and hasattr(self._last_instance, name):
-                return getattr(self._last_instance, name)
-        with self._manager.lease_model(self._model_key) as (model, _):
-            self._last_instance = model
-            return getattr(model, name)
+        if name in self.SAFE_METADATA_ATTRIBUTES:
+            with self._manager._lock:
+                cached = self._manager._cache.get(self._model_key)
+                if cached is not None and hasattr(cached, name):
+                    return getattr(cached, name)
+            if name in self.__dict__:
+                return self.__dict__[name]
+            raise AttributeError(f"Metadata attribute '{name}' is not currently available on '{self.__class__.__name__}'.")
+
+        if name in ("model", "tokenizer"):
+            raise RuntimeError(
+                f"Direct access to raw '{name}' on '{self.__class__.__name__}' is disabled "
+                "to prevent use-after-unload race conditions and GPU memory corruption outside active leases. "
+                f"Use 'with MODEL_MANAGER.lease_model(\"{self._model_key}\") as (model, meta):' "
+                "to safely access model internals under an active lease."
+            )
+
+        raise AttributeError(
+            f"'{self.__class__.__name__}' does not expose raw model internal or method '{name}'. "
+            "Returning bound methods or internal mutable resources outside an active lease causes "
+            "use-after-unload race conditions and GPU memory corruption. "
+            f"Use 'with MODEL_MANAGER.lease_model(\"{self._model_key}\") as (model, meta):' "
+            f"to access '{name}' safely while holding an active lease."
+        )
 
 
 # ==============================================================================
