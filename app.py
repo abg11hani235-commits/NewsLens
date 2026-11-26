@@ -61,12 +61,13 @@ class SafeModelProxy(AbstractiveSummarizer):
     This prevents concurrent eviction, use-after-unload conditions, or
     accessing deallocated tokenizers during in-flight inference requests.
 
-    Security & Resource Lifecycle Guarantees:
-    - Raw model weights (.model) and tokenizers (.tokenizer) are strictly shielded
-      and cannot be accessed directly outside of an active lease context.
-    - Bound methods, PyTorch internals, and mutable resources cannot be extracted
-      or invoked via dynamic attribute access without holding an active lease.
-    - Only explicitly whitelisted, safe metadata and configuration attributes are exposed.
+    Encapsulation & Resource Lifecycle Guarantees:
+    - Does not retain any reference to the underlying model, tokenizer, or
+      ModelManager on ordinary proxy instance attributes (`__dict__`).
+    - Direct access to `.model`, `.tokenizer`, or unsupported internals via
+      ordinary attribute access raises descriptive errors with migration guidance.
+    - Supported metadata properties read safe values dynamically without
+      exposing mutable internal state or retaining references after lease exit.
     """
 
     SAFE_METADATA_ATTRIBUTES = frozenset({
@@ -86,72 +87,92 @@ class SafeModelProxy(AbstractiveSummarizer):
     })
 
     def __init__(self, manager: "ModelManager", model_key: str):
-        self._manager = manager
-        self._model_key = model_key
         self.model_name = PRIMARY_MODEL_NAME if model_key == "bart" else ALTERNATIVE_MODEL_NAME
         self.device = get_device()
         self.is_cuda = (self.device.type == "cuda")
         self.is_t5 = "t5" in self.model_name.lower()
         self.use_fp16 = self.is_cuda
         self.max_input_length = T5_MAX_INPUT_LENGTH if self.is_t5 else BART_MAX_INPUT_LENGTH
-        self.generation_params = dict(GENERATION_PARAMS)
-        self._fallback_lock = threading.RLock()
-        self._last_instance: Optional[Any] = None
-        self.init_time_sec = 0.0
+        self._generation_params = dict(GENERATION_PARAMS)
+        self._model_key = model_key
+        fallback_lock = threading.RLock()
+
+        def _dispatch_lease(fn_name: str, *args, **kwargs) -> Any:
+            with manager.lease_model(model_key, warmup=False) as (model, _):
+                if fn_name == "warmup":
+                    if hasattr(model, "warmup"):
+                        return model.warmup(*args, **kwargs)
+                    return 0.0
+                return getattr(model, fn_name)(*args, **kwargs)
+
+        def _query_state(attr: str, default: Any = None) -> Any:
+            with manager._lock:
+                if attr == "is_inferring":
+                    if manager._active_leases.get(model_key, 0) > 0:
+                        return True
+                    cached = manager._cache.get(model_key)
+                    return getattr(cached, "is_inferring", False) if cached is not None else False
+                if attr == "is_unloaded":
+                    cached = manager._cache.get(model_key)
+                    if cached is None:
+                        return True
+                    return getattr(cached, "is_unloaded", False)
+                if attr == "_inference_lock":
+                    cached = manager._cache.get(model_key)
+                    if cached is not None and hasattr(cached, "_inference_lock"):
+                        return cached._inference_lock
+                    return fallback_lock
+                cached = manager._cache.get(model_key)
+                if cached is not None and hasattr(cached, attr):
+                    val = getattr(cached, attr)
+                    if isinstance(val, list):
+                        return list(val)
+                    if isinstance(val, dict):
+                        return dict(val)
+                    return val
+                return default
+
+        def _dispatch_unload() -> None:
+            manager.unload_model(model_key)
+
+        self._dispatch_lease = _dispatch_lease
+        self._query_state = _query_state
+        self._dispatch_unload = _dispatch_unload
+
+    @property
+    def generation_params(self) -> Dict[str, Any]:
+        cached_params = self._query_state("generation_params", None)
+        if isinstance(cached_params, dict):
+            return dict(cached_params)
+        return dict(self._generation_params)
+
+    @property
+    def init_time_sec(self) -> float:
+        return float(self._query_state("init_time_sec", 0.0))
 
     @property
     def _inference_lock(self) -> threading.RLock:
-        with self._manager._lock:
-            cached = self._manager._cache.get(self._model_key)
-            if cached is not None and hasattr(cached, "_inference_lock"):
-                return cached._inference_lock
-            if self._last_instance is not None and hasattr(self._last_instance, "_inference_lock"):
-                return self._last_instance._inference_lock
-        return self._fallback_lock
+        return self._query_state("_inference_lock")
 
     @property
     def is_unloaded(self) -> bool:
-        with self._manager._lock:
-            cached = self._manager._cache.get(self._model_key)
-            if cached is not None:
-                return getattr(cached, "is_unloaded", False)
-            if self._last_instance is not None:
-                return getattr(self._last_instance, "is_unloaded", True)
-        return True
+        return bool(self._query_state("is_unloaded", True))
 
     @property
     def is_inferring(self) -> bool:
-        with self._manager._lock:
-            if self._manager._active_leases.get(self._model_key, 0) > 0:
-                return True
-            cached = self._manager._cache.get(self._model_key)
-            if cached is not None and hasattr(cached, "is_inferring"):
-                return cached.is_inferring
-        return False
+        return bool(self._query_state("is_inferring", False))
 
     @property
     def cold_latency_sec(self) -> Optional[float]:
-        with self._manager._lock:
-            cached = self._manager._cache.get(self._model_key)
-            if cached is not None and hasattr(cached, "cold_latency_sec"):
-                return cached.cold_latency_sec
-        return None
+        return self._query_state("cold_latency_sec", None)
 
     @property
     def warm_latencies(self) -> List[float]:
-        with self._manager._lock:
-            cached = self._manager._cache.get(self._model_key)
-            if cached is not None and hasattr(cached, "warm_latencies"):
-                return list(cached.warm_latencies)
-        return []
+        return list(self._query_state("warm_latencies", []))
 
     @property
     def inference_count(self) -> int:
-        with self._manager._lock:
-            cached = self._manager._cache.get(self._model_key)
-            if cached is not None and hasattr(cached, "inference_count"):
-                return cached.inference_count
-        return 0
+        return int(self._query_state("inference_count", 0))
 
     @property
     def _load_model_and_tokenizer(self) -> Any:
@@ -192,34 +213,25 @@ class SafeModelProxy(AbstractiveSummarizer):
         )
 
     def summarize_text(self, text: str, **kwargs) -> Dict[str, Any]:
-        with self._manager.lease_model(self._model_key) as (model, _):
-            self._last_instance = model
-            return model.summarize_text(text, **kwargs)
+        return self._dispatch_lease("summarize_text", text, **kwargs)
 
     def summarize_batch(self, texts: List[str], **kwargs) -> List[Dict[str, Any]]:
-        with self._manager.lease_model(self._model_key) as (model, _):
-            self._last_instance = model
-            return model.summarize_batch(texts, **kwargs)
+        return self._dispatch_lease("summarize_batch", texts, **kwargs)
 
     def warmup(self, sample_text: Optional[str] = None) -> float:
-        with self._manager.lease_model(self._model_key, warmup=False) as (model, _):
-            self._last_instance = model
-            if hasattr(model, "warmup"):
-                return model.warmup(sample_text=sample_text)
-            return 0.0
+        return self._dispatch_lease("warmup", sample_text=sample_text)
 
     def unload_model(self) -> None:
-        self._manager.unload_model(self._model_key)
+        self._dispatch_unload()
 
     def is_inferencing(self) -> bool:
         return self.is_inferring
 
     def __getattr__(self, name: str) -> Any:
         if name in self.SAFE_METADATA_ATTRIBUTES:
-            with self._manager._lock:
-                cached = self._manager._cache.get(self._model_key)
-                if cached is not None and hasattr(cached, name):
-                    return getattr(cached, name)
+            val = self._query_state(name, None)
+            if val is not None:
+                return val
             if name in self.__dict__:
                 return self.__dict__[name]
             raise AttributeError(f"Metadata attribute '{name}' is not currently available on '{self.__class__.__name__}'.")
@@ -469,8 +481,7 @@ class ModelManager:
                 self._proxies[model_key] = SafeModelProxy(self, model_key)
             proxy = self._proxies[model_key]
 
-        with self.lease_model(model_key, warmup=warmup, timeout=timeout) as (real_model, meta):
-            proxy._last_instance = real_model
+        with self.lease_model(model_key, warmup=warmup, timeout=timeout) as (_, meta):
             res_meta = dict(meta)
 
         return proxy, res_meta

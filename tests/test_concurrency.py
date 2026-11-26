@@ -8,7 +8,9 @@ Verifies:
 5. Timeout safety when all cached models are actively leased.
 """
 
+import gc
 import time
+import weakref
 import logging
 import threading
 from typing import Optional, List, Dict, Any
@@ -528,21 +530,25 @@ def test_legacy_retrieval_safe_proxy_prevents_use_after_unload():
     with patch("app.AbstractiveSummarizer", side_effect=lambda model_name, **kw: MockSummarizer(model_name)):
         # 1. Retrieve legacy model reference
         t5_proxy = mgr.get_model("t5")
-        first_instance = t5_proxy._last_instance
+        first_instance = mgr._cache["t5"]
         assert first_instance is not None
         assert not first_instance.is_unloaded
+        assert not t5_proxy.is_unloaded
 
         # 2. Evict T5 by leasing BART
         with mgr.lease_model("bart") as (bart_model, _):
             assert "bart" in mgr._cache
             assert "t5" not in mgr._cache
             assert first_instance.is_unloaded
+            assert t5_proxy.is_unloaded
 
         # 3. Caller uses the previously retrieved t5_proxy for inference.
         # SafeModelProxy must safely re-lease and reload T5 without throwing use-after-unload error.
         res = t5_proxy.summarize_text("Testing transparent re-leasing after eviction")
         assert "t5" in res["summary"]
-        assert not t5_proxy._last_instance.is_unloaded
+        assert "t5" in mgr._cache
+        assert not mgr._cache["t5"].is_unloaded
+        assert not t5_proxy.is_unloaded
 
 
 def test_batch_preprocessing_and_oom_fallback_safety():
@@ -713,4 +719,55 @@ def test_proxy_supported_legacy_apis_continue_working():
         assert not proxy.is_unloaded
         proxy.unload_model()
         assert proxy.is_unloaded
+
+
+def test_proxy_retains_no_raw_model_after_summarize_and_warmup():
+    """Verify via weakref that SafeModelProxy does not retain any model reference after inference or warmup."""
+    mgr = ModelManager(max_cached_models=1)
+
+    with patch("app.AbstractiveSummarizer", side_effect=lambda model_name, **kw: MockSummarizer(model_name)):
+        proxy = mgr.get_model("t5")
+
+        # Execute all supported inference methods
+        proxy.summarize_text("First article for reference retention test.")
+        proxy.summarize_batch(["Second article.", "Third article."])
+        proxy.warmup("Warmup text.")
+
+        # Track the active model instance via weakref
+        model_weakref = weakref.ref(mgr._cache["t5"])
+        assert model_weakref() is not None
+
+        # Evict T5 from the manager cache
+        mgr.unload_all()
+        assert "t5" not in mgr._cache
+
+        # Force garbage collection; proxy must NOT hold any strong reference keeping the model alive
+        gc.collect()
+        assert model_weakref() is None
+
+
+def test_proxy_instance_attributes_do_not_expose_internals():
+    """Verify SafeModelProxy.__dict__ and ordinary attribute access never expose raw model, manager, or cache."""
+    from src.summarizer import AbstractiveSummarizer
+
+    mgr = ModelManager(max_cached_models=1)
+
+    with patch("app.AbstractiveSummarizer", side_effect=lambda model_name, **kw: MockSummarizer(model_name)):
+        proxy = mgr.get_model("t5")
+        proxy.summarize_text("Test text")
+
+        # 1. Inspect instance attributes: no raw model, manager, or cache objects in __dict__
+        for attr_name, attr_val in proxy.__dict__.items():
+            assert attr_name not in ("_last_instance", "_manager", "_cache", "model", "tokenizer")
+            assert not isinstance(attr_val, (ModelManager, AbstractiveSummarizer, MockSummarizer))
+
+        # 2. Ordinary attribute access to _last_instance, _manager, _cache must raise AttributeError
+        for blocked_attr in ("_last_instance", "_manager", "_cache"):
+            with pytest.raises(AttributeError, match="does not expose raw model internal or method"):
+                _ = getattr(proxy, blocked_attr)
+
+        # 3. Direct access to generation_params returns a defensive copy, not shared mutable state
+        gp1 = proxy.generation_params
+        gp1["max_length"] = 999999
+        assert proxy.generation_params["max_length"] != 999999
 
